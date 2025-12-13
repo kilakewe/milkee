@@ -38,10 +38,14 @@ static void pwr_button_user_Task(void *arg) {
         if (get_bit_button(even, 0)) // Immediately enter low-power mode
         {
             esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_AUTO);
-            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);     
-            const uint64_t ext_wakeup_pin_1_mask = 1ULL << ext_wakeup_pin_1;
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+            // ESP-IDF EXT1 wake supports ANY_HIGH or ALL_LOW.
+            // These buttons are active-low; to wake on "any low" across multiple pins,
+            // use EXT0 for one pin and EXT1 (single-pin, ALL_LOW) for the other.
+            ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(ext_wakeup_pin_1, 0));
             const uint64_t ext_wakeup_pin_3_mask = 1ULL << ext_wakeup_pin_3;
-            ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(ext_wakeup_pin_1_mask | ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ANY_LOW)); 
+            ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ALL_LOW));
             ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(ext_wakeup_pin_3));
             ESP_ERROR_CHECK(rtc_gpio_pullup_en(ext_wakeup_pin_3));
             esp_sleep_enable_timer_wakeup(basic_rtc_set_time * 1000 * 1000);
@@ -102,14 +106,15 @@ static void default_sleep_user_Task(void *arg) {
             if (*sleep_arg == 1) {
                 esp_sleep_pd_config(
                     ESP_PD_DOMAIN_MAX,
-                    ESP_PD_OPTION_AUTO);   
+                    ESP_PD_OPTION_AUTO);
                 esp_sleep_disable_wakeup_source(
-                    ESP_SLEEP_WAKEUP_ALL); 
-                const uint64_t ext_wakeup_pin_1_mask = 1ULL << ext_wakeup_pin_1;
+                    ESP_SLEEP_WAKEUP_ALL);
+
+                ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(ext_wakeup_pin_1, 0));
                 const uint64_t ext_wakeup_pin_3_mask = 1ULL << ext_wakeup_pin_3;
                 ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(
-                    ext_wakeup_pin_1_mask | ext_wakeup_pin_3_mask,
-                    ESP_EXT1_WAKEUP_ANY_LOW)); 
+                    ext_wakeup_pin_3_mask,
+                    ESP_EXT1_WAKEUP_ALL_LOW));
                 ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(ext_wakeup_pin_3));
                 ESP_ERROR_CHECK(rtc_gpio_pullup_en(ext_wakeup_pin_3));
                 esp_sleep_enable_timer_wakeup(basic_rtc_set_time * 1000 * 1000);
@@ -123,21 +128,23 @@ static void default_sleep_user_Task(void *arg) {
 
 static void get_wakeup_gpio(void) {
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+    if (ESP_SLEEP_WAKEUP_EXT0 == wakeup_reason) {
+        // EXT0 is configured on ext_wakeup_pin_1 (active-low).
+        xEventGroupSetBits(boot_groups, set_bit_button(0));
+        return;
+    }
+
     if (ESP_SLEEP_WAKEUP_EXT1 == wakeup_reason) {
         uint64_t wakeup_pins = esp_sleep_get_ext1_wakeup_status();
-        if (wakeup_pins == 0)
+        if (wakeup_pins == 0) {
             return;
-        if (wakeup_pins & (1ULL << ext_wakeup_pin_1)) {
-            // esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
-            // //Disable the previous timer first
-            // esp_sleep_enable_timer_wakeup(basic_rtc_set_time * 1000 * 1000);
-            // //Reset the 10-second timer
-            xEventGroupSetBits(boot_groups, set_bit_button(0)); 
-        } else if (wakeup_pins & (1ULL << ext_wakeup_pin_3)) {
+        }
+        if (wakeup_pins & (1ULL << ext_wakeup_pin_3)) {
             return;
         }
     } else if (ESP_SLEEP_WAKEUP_TIMER == wakeup_reason) {
-        xEventGroupSetBits(boot_groups, set_bit_button(0)); 
+        xEventGroupSetBits(boot_groups, set_bit_button(0));
     }
 }
 

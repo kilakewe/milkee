@@ -58,7 +58,7 @@ static void Network_user_Task(void *arg) {
             esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);      
             const uint64_t ext_wakeup_pin_3_mask = 1ULL << ext_wakeup_pin_3;
             ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(
-                ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ANY_LOW)); 
+                ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ALL_LOW)); 
             ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(ext_wakeup_pin_3));
             ESP_ERROR_CHECK(rtc_gpio_pullup_en(ext_wakeup_pin_3));
             esp_sleep_enable_timer_wakeup(30 * 1000 * 1000); 
@@ -87,8 +87,8 @@ static void Network_sleep_Task(void *arg) {
                 esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_AUTO); 
                 esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);      
                 const uint64_t ext_wakeup_pin_3_mask = 1ULL << ext_wakeup_pin_3;
-                ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(
-                    ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ANY_LOW)); 
+                    ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(
+                    ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ALL_LOW)); 
                 ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(ext_wakeup_pin_3));
                 ESP_ERROR_CHECK(rtc_gpio_pullup_en(ext_wakeup_pin_3));
                 esp_sleep_enable_timer_wakeup(30 * 1000 * 1000); // 15s
@@ -128,7 +128,7 @@ static void pwr_button_user_Task(void *arg) {
             esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);      
             const uint64_t ext_wakeup_pin_3_mask = 1ULL << ext_wakeup_pin_3;
             ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(
-                ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ANY_LOW)); 
+                ext_wakeup_pin_3_mask, ESP_EXT1_WAKEUP_ALL_LOW)); 
             ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(ext_wakeup_pin_3));
             ESP_ERROR_CHECK(rtc_gpio_pullup_en(ext_wakeup_pin_3));
             esp_sleep_enable_timer_wakeup(30 * 1000 * 1000);
