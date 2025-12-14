@@ -47,7 +47,7 @@ static void Network_user_Task(void *arg) {
                 
                 xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
                 Green_led_arg = 1;
-                GUI_ReadBmp_RGB_6Color("/sdcard/02_sys_ap_img/user_send.bmp", 0, 0);
+                GUI_ReadBmp_RGB_6Color("/sdcard/user/current-img/user_send.bmp", 0, 0);
                 epaper_port_display(epd_blackImage);    
                 xSemaphoreGive(epaper_gui_semapHandle); 
                 Green_led_arg = 0;                      

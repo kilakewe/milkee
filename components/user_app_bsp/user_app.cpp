@@ -3,9 +3,13 @@
 #include "button_bsp.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
+#include "esp_timer.h"
+#include "driver/rtc_io.h"
 #include "i2c_bsp.h"
 #include "led_bsp.h"
 #include "sdcard_bsp.h"
+#include "server_bsp.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -250,6 +254,98 @@ static void Red_led_user_Task(void *arg)
     }
 }
 
+// Minimal "app" that:
+// - runs a Wi-Fi AP + HTTP server (see components/http_server_bsp)
+// - accepts a raw 24-bit BMP via POST /dataUP
+//   (800x480 for 0/180; 480x800 for 90/270)
+// - displays it on the e-paper panel when upload completes
+static void BrowserImageUploadDisplayTask(void *arg)
+{
+    (void)arg;
+
+    const uint32_t imagesize = ((EXAMPLE_LCD_WIDTH % 2 == 0) ? (EXAMPLE_LCD_WIDTH / 2)
+                                                             : (EXAMPLE_LCD_WIDTH / 2 + 1)) *
+                               EXAMPLE_LCD_HEIGHT;
+
+    uint8_t *epd_blackImage = (uint8_t *)heap_caps_malloc(imagesize * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
+    if (!epd_blackImage)
+    {
+        ESP_LOGE("browser_upload", "Failed to allocate e-paper buffer (%lu bytes)", (unsigned long)imagesize);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    Paint_NewImage(epd_blackImage, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, server_bsp_get_rotation(), EPD_7IN3E_WHITE);
+    Paint_SetScale(6);
+    Paint_SelectImage(epd_blackImage);
+    Paint_Clear(EPD_7IN3E_WHITE);
+
+    for (;;)
+    {
+        EventBits_t bits = xEventGroupWaitBits(server_groups, set_bit_button(2), pdTRUE, pdFALSE, portMAX_DELAY);
+        if (!get_bit_button(bits, 2))
+        {
+            continue;
+        }
+
+        if (pdTRUE == xSemaphoreTake(epaper_gui_semapHandle, pdMS_TO_TICKS(2000)))
+        {
+            // Green LED blinks while drawing.
+            Green_led_arg = 1;
+            xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
+
+            // Re-init the paint buffer for the current rotation.
+            // IMPORTANT: Paint_SetRotate() does not update Paint.Width/Paint.Height, so for 90/270
+            // we must call Paint_NewImage() to swap the logical dimensions safely.
+            const uint16_t rotation = server_bsp_get_rotation();
+            Paint_NewImage(epd_blackImage, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, rotation, EPD_7IN3E_WHITE);
+            Paint_SetScale(6);
+            Paint_SelectImage(epd_blackImage);
+
+            GUI_ReadBmp_RGB_6Color("/sdcard/user/current-img/user_send.bmp", 0, 0);
+            epaper_port_display(epd_blackImage);
+
+            xSemaphoreGive(epaper_gui_semapHandle);
+            Green_led_arg = 0;
+        }
+    }
+}
+
+static void BrowserUploadIdleSleepTask(void *arg)
+{
+    (void)arg;
+
+    constexpr uint64_t kIdleTimeoutUs = 10ULL * 60ULL * 1000000ULL;
+    constexpr gpio_num_t kWakeKeyPin = GPIO_NUM_4; // Key button (active-low)
+
+    for (;;)
+    {
+        const uint64_t now = esp_timer_get_time();
+        const uint64_t last = server_bsp_get_last_activity_us();
+
+        if (last != 0 && now > last && (now - last) > kIdleTimeoutUs)
+        {
+            ESP_LOGI("browser_upload", "Idle for 10 minutes; entering deep sleep (wake on key button)");
+
+            // Stop Wi-Fi before sleeping.
+            set_espWifi_sleep();
+
+            esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_AUTO);
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+            const uint64_t mask = 1ULL << kWakeKeyPin;
+            ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ALL_LOW));
+            ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
+            ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
+
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_deep_sleep_start();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
 static void key1_button_user_Task(void *arg)
 {
     esp_err_t ret;
@@ -308,7 +404,7 @@ uint8_t User_Mode_init(void)
     // #if CONFIG_BOARD_TYPE_ESP32S3_PhotoPaint
     // Always render a 4x4 color-index test pattern (0x0..0xF) on boot for the PhotoPainter board.
     // This is intentionally before SD init so the panel shows something even if SD init fails.
-    RenderBootTestPattern();
+    // RenderBootTestPattern();
     // #endif
 
     uint8_t sdcard_win = _sdcard_init(); /* SD Card Initialization */
@@ -336,5 +432,12 @@ uint8_t User_Mode_init(void)
     xTaskCreate(Green_led_user_Task, "Green_led_user_Task", 3 * 1024, &Green_led_arg, 2, NULL);
     xTaskCreate(Red_led_user_Task, "Red_led_user_Task", 3 * 1024, &Red_led_arg, 2, NULL);
     xTaskCreate(axp2101_isCharging_task, "axp2101_isCharging_task", 3 * 1024, NULL, 2, NULL); // AXP2101 Charging
+
+    // Browser upload app
+    Network_wifi_ap_init();
+    http_server_init();
+    xTaskCreate(BrowserImageUploadDisplayTask, "BrowserImageUploadDisplayTask", 6 * 1024, NULL, 2, NULL);
+    xTaskCreate(BrowserUploadIdleSleepTask, "BrowserUploadIdleSleepTask", 4 * 1024, NULL, 2, NULL);
+
     return 1;
 }
