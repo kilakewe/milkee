@@ -7,11 +7,18 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
     h1 { margin: 0 0 12px 0; font-size: 18px; }
+    h2 { margin: 18px 0 10px 0; font-size: 16px; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
     button { padding: 8px 12px; }
     #preview { width: 100%; max-width: 800px; height: auto; border: 1px solid #ccc; background: #eee; }
     #status { white-space: pre-wrap; font-size: 12px; color: #333; }
     .hint { font-size: 12px; color: #666; }
+
+    .photo-list { list-style: none; padding: 0; margin: 0; max-width: 800px; }
+    .photo-item { display: flex; gap: 8px; align-items: center; padding: 6px 4px; border-bottom: 1px solid #eee; }
+    .photo-item.current { background: #f0f8ff; }
+    .photo-name { flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; word-break: break-all; }
+    .photo-actions button { padding: 6px 10px; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -34,6 +41,16 @@
   <div class="hint">Tip: the preview below is what will be sent (dithered to 6 colors and cropped to match rotation).</div>
   <canvas id="preview" width="800" height="480"></canvas>
   <div id="status"></div>
+
+  <h2>Stored photos</h2>
+  <div class="row">
+    <button id="refreshPhotos" type="button">Refresh list</button>
+    <button id="nextPhoto" type="button">Next photo (device)</button>
+  </div>
+  <div class="hint">Photos are stored on the SD card under <code>/user/current-img/</code>.</div>
+  <div id="photoCount" class="hint"></div>
+  <ul id="photoList" class="photo-list"></ul>
+
   <script src="/app.js"></script>
 </body>
 </html>

@@ -329,7 +329,11 @@ static void BrowserImageUploadDisplayTask(void *arg)
             Paint_SelectImage(epd_blackImage);
 
             // If rotation changed after upload, rotate the current picture in software so it still fills the screen.
-            GUI_ReadBmp_RGB_6Color_Rotate("/sdcard/user/current-img/user_send.bmp", 0, 0, img_rotation, rotation);
+            const char *img_path = server_bsp_get_current_image_path();
+            if (img_path && img_path[0] != '\0')
+            {
+                GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, img_rotation, rotation);
+            }
             epaper_port_display(epd_blackImage);
 
             xSemaphoreGive(epaper_gui_semapHandle);
@@ -470,12 +474,22 @@ uint8_t User_Mode_init(void)
     Network_wifi_ap_init();
     http_server_init();
 
+    // If we woke from deep sleep (key button), advance to the next stored photo.
+    const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+    if (wake == ESP_SLEEP_WAKEUP_EXT1)
+    {
+        (void)server_bsp_select_next_photo();
+    }
+
     // Heartbeat: blink red LED while the device is awake.
     Red_led_arg = 1;
     xEventGroupSetBits(Red_led_Mode_queue, set_bit_button(6));
 
     xTaskCreate(BrowserImageUploadDisplayTask, "BrowserImageUploadDisplayTask", 6 * 1024, NULL, 2, NULL);
     xTaskCreate(BrowserUploadIdleSleepTask, "BrowserUploadIdleSleepTask", 4 * 1024, NULL, 2, NULL);
+
+    // Render the currently selected photo on startup.
+    xEventGroupSetBits(server_groups, set_bit_button(2));
 
     return 1;
 }

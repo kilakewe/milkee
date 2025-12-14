@@ -11,17 +11,28 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <dirent.h>
 
 static const char *TAG = "server_bsp";
 
 static const char *kNvsNamespace = "BrowserUpload";
 static const char *kNvsKeyRotation = "rotation";
 static const char *kNvsKeyImageRotation = "image_rotation";
+static const char *kNvsKeyCurrentImage = "current_image";
+static const char *kNvsKeyPhotoSeq = "photo_seq";
+
+// SD card paths
+static const char *kSdWebRoot = "/sdcard/system";
+static const char *kUserPhotoDir = "/sdcard/user/current-img";
 
 static uint16_t s_rotation_deg = 180;
 static uint16_t s_image_rotation_deg = 180;
+static char s_current_image_path[192] = {0};
+static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static uint64_t s_last_activity_us = 0;
 static portMUX_TYPE s_activity_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -48,7 +59,15 @@ uint16_t server_bsp_get_rotation(void)
 
 uint16_t server_bsp_get_image_rotation(void)
 {
-    return s_image_rotation_deg;
+    portENTER_CRITICAL(&s_state_mux);
+    const uint16_t v = s_image_rotation_deg;
+    portEXIT_CRITICAL(&s_state_mux);
+    return v;
+}
+
+const char *server_bsp_get_current_image_path(void)
+{
+    return s_current_image_path;
 }
 
 esp_err_t server_bsp_set_rotation(uint16_t rotation_deg)
@@ -76,14 +95,70 @@ esp_err_t server_bsp_set_rotation(uint16_t rotation_deg)
     return err;
 }
 
-static void server_bsp_load_rotation_from_nvs(void)
+static bool server_bsp_ends_with_ignore_case(const char *s, const char *suffix)
+{
+    const size_t sl = strlen(s);
+    const size_t su = strlen(suffix);
+    if (sl < su) return false;
+
+    const char *p = s + (sl - su);
+    for (size_t i = 0; i < su; i++) {
+        char a = p[i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static uint16_t server_bsp_parse_rotation_from_filename(const char *name, uint16_t default_rot)
+{
+    if (!name) return default_rot;
+
+    const char *p = strstr(name, "_r");
+    if (!p) return default_rot;
+
+    p += 2;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p) return default_rot;
+
+    const uint16_t rot = (uint16_t)v;
+    if (rot == 0 || rot == 90 || rot == 180 || rot == 270) {
+        return rot;
+    }
+    return default_rot;
+}
+
+static void server_bsp_set_current_image_internal(const char *full_path, uint16_t img_rot)
+{
+    portENTER_CRITICAL(&s_state_mux);
+    snprintf(s_current_image_path, sizeof(s_current_image_path), "%s", full_path ? full_path : "");
+    s_image_rotation_deg = img_rot;
+    portEXIT_CRITICAL(&s_state_mux);
+
+    nvs_handle_t nvs = 0;
+    if (nvs_open(kNvsNamespace, NVS_READWRITE, &nvs) == ESP_OK)
+    {
+        nvs_set_str(nvs, kNvsKeyCurrentImage, s_current_image_path);
+        nvs_set_u16(nvs, kNvsKeyImageRotation, s_image_rotation_deg);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+static void server_bsp_load_state_from_nvs(void)
 {
     nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &nvs);
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "NVS open failed (%s); using default rotation %u", esp_err_to_name(err), (unsigned)s_rotation_deg);
+        ESP_LOGW(TAG, "NVS open failed (%s); using defaults", esp_err_to_name(err));
+        portENTER_CRITICAL(&s_state_mux);
         s_image_rotation_deg = s_rotation_deg;
+        s_current_image_path[0] = '\0';
+        portEXIT_CRITICAL(&s_state_mux);
         return;
     }
 
@@ -92,6 +167,9 @@ static void server_bsp_load_rotation_from_nvs(void)
 
     const esp_err_t err_rot = nvs_get_u16(nvs, kNvsKeyRotation, &rot);
     const esp_err_t err_img = nvs_get_u16(nvs, kNvsKeyImageRotation, &img_rot);
+
+    size_t cur_len = sizeof(s_current_image_path);
+    const esp_err_t err_cur = nvs_get_str(nvs, kNvsKeyCurrentImage, s_current_image_path, &cur_len);
 
     nvs_close(nvs);
 
@@ -115,16 +193,87 @@ static void server_bsp_load_rotation_from_nvs(void)
         // If no image rotation was saved yet, assume it matches the current rotation.
         s_image_rotation_deg = s_rotation_deg;
     }
+
+    if (err_cur == ESP_OK && s_current_image_path[0] != '\0')
+    {
+        ESP_LOGI(TAG, "Loaded current image from NVS: %s", s_current_image_path);
+    }
+    else
+    {
+        s_current_image_path[0] = '\0';
+    }
+}
+
+esp_err_t server_bsp_select_next_photo(void)
+{
+    // Determine the current file name (basename).
+    // NOTE: Use precision-limited snprintf() to avoid -Wformat-truncation warnings (treated as errors).
+    char current_name[128] = {0};
+    {
+        portENTER_CRITICAL(&s_state_mux);
+        const char *base = strrchr(s_current_image_path, '/');
+        base = base ? (base + 1) : s_current_image_path;
+        snprintf(current_name, sizeof(current_name), "%.*s", (int)sizeof(current_name) - 1, base);
+        portEXIT_CRITICAL(&s_state_mux);
+    }
+
+    DIR *dir = opendir(kUserPhotoDir);
+    if (!dir)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char first[128] = {0};
+    char next[128] = {0};
+
+    struct dirent *ent = NULL;
+    while ((ent = readdir(dir)) != NULL)
+    {
+        const char *name = ent->d_name;
+        if (!name || name[0] == '.') {
+            continue;
+        }
+        if (!server_bsp_ends_with_ignore_case(name, ".bmp")) {
+            continue;
+        }
+
+        // Avoid truncated comparisons/copies: only consider names that fit.
+        if (strlen(name) >= sizeof(first)) {
+            continue;
+        }
+
+        if (first[0] == '\0' || strcmp(name, first) < 0) {
+            snprintf(first, sizeof(first), "%.*s", (int)sizeof(first) - 1, name);
+        }
+
+        if (current_name[0] != '\0' && strcmp(name, current_name) <= 0) {
+            continue;
+        }
+
+        if (next[0] == '\0' || strcmp(name, next) < 0) {
+            snprintf(next, sizeof(next), "%.*s", (int)sizeof(next) - 1, name);
+        }
+    }
+
+    closedir(dir);
+
+    const char *chosen = (next[0] != '\0') ? next : ((first[0] != '\0') ? first : NULL);
+    if (!chosen) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char full[192] = {0};
+    snprintf(full, sizeof(full), "%s/%s", kUserPhotoDir, chosen);
+
+    const uint16_t img_rot = server_bsp_parse_rotation_from_filename(chosen, s_rotation_deg);
+    server_bsp_set_current_image_internal(full, img_rot);
+    return ESP_OK;
 }
 
 // Static web UI is served from the SD card under:
 //   /sdcard/system/
 // Repository copy lives under:
 //   sd-content/system/
-static const char *kSdWebRoot = "/sdcard/system";
-
-static const char *kUserCurrentImgDir = "/sdcard/user/current-img";
-static const char *kUserCurrentBmpPath = "/sdcard/user/current-img/user_send.bmp";
 
 #define MIN(x, y) ((x < y) ? (x) : (y))
 #define READ_LEN_MAX (10 * 1024) // Buffer area for receiving data
@@ -144,6 +293,12 @@ esp_err_t post_dataup_callback(httpd_req_t *req);
 // Rotation settings API
 esp_err_t get_rotation_callback(httpd_req_t *req);
 esp_err_t post_rotation_callback(httpd_req_t *req);
+
+// Photo management API
+esp_err_t get_photos_callback(httpd_req_t *req);
+esp_err_t post_photos_select_callback(httpd_req_t *req);
+esp_err_t post_photos_next_callback(httpd_req_t *req);
+esp_err_t post_photos_delete_callback(httpd_req_t *req);
 
 /*html 代码*/
 static void server_bsp_ensure_dir(const char *path)
@@ -179,11 +334,17 @@ void http_server_init(void) {
     ESP_ERROR_CHECK(httpd_start(&server, &config));
 
     server_bsp_mark_activity_internal();
-    server_bsp_load_rotation_from_nvs();
 
     // Ensure the user image save directory exists.
     server_bsp_ensure_dir("/sdcard/user");
-    server_bsp_ensure_dir(kUserCurrentImgDir);
+    server_bsp_ensure_dir(kUserPhotoDir);
+
+    server_bsp_load_state_from_nvs();
+
+    // If no current image is selected yet, try to pick the first BMP on SD.
+    if (s_current_image_path[0] == '\0') {
+        (void)server_bsp_select_next_photo();
+    }
 
     // Rotation settings API
     httpd_uri_t uri_rot = {};
@@ -196,6 +357,30 @@ void http_server_init(void) {
     uri_rot.method  = HTTP_POST;
     uri_rot.handler = post_rotation_callback;
     httpd_register_uri_handler(server, &uri_rot);
+
+    // Photo management API
+    httpd_uri_t uri_photos = {};
+    uri_photos.user_ctx    = NULL;
+
+    uri_photos.uri     = "/api/photos";
+    uri_photos.method  = HTTP_GET;
+    uri_photos.handler = get_photos_callback;
+    httpd_register_uri_handler(server, &uri_photos);
+
+    uri_photos.uri     = "/api/photos/select";
+    uri_photos.method  = HTTP_POST;
+    uri_photos.handler = post_photos_select_callback;
+    httpd_register_uri_handler(server, &uri_photos);
+
+    uri_photos.uri     = "/api/photos/next";
+    uri_photos.method  = HTTP_POST;
+    uri_photos.handler = post_photos_next_callback;
+    httpd_register_uri_handler(server, &uri_photos);
+
+    uri_photos.uri     = "/api/photos/delete";
+    uri_photos.method  = HTTP_POST;
+    uri_photos.handler = post_photos_delete_callback;
+    httpd_register_uri_handler(server, &uri_photos);
 
     httpd_uri_t uri_post = {};
     uri_post.uri         = "/dataUP";
@@ -412,6 +597,321 @@ esp_err_t post_rotation_callback(httpd_req_t *req)
     return ESP_OK;
 }
 
+static void server_bsp_trim_in_place(char *s)
+{
+    if (!s) {
+        return;
+    }
+
+    // Trim leading whitespace.
+    char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+
+    // Trim trailing whitespace.
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[len - 1] = '\0';
+        len--;
+    }
+}
+
+static bool server_bsp_photo_name_is_safe(const char *name)
+{
+    if (!name || name[0] == '\0') {
+        return false;
+    }
+
+    // Keep names bounded so we can safely store them in fixed-size buffers elsewhere.
+    if (strlen(name) >= 128) {
+        return false;
+    }
+    if (name[0] == '.') {
+        return false;
+    }
+    if (strstr(name, "..") != NULL) {
+        return false;
+    }
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL) {
+        return false;
+    }
+    if (!server_bsp_ends_with_ignore_case(name, ".bmp")) {
+        return false;
+    }
+
+    for (const char *p = name; *p; p++) {
+        const char c = *p;
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static esp_err_t server_bsp_recv_small_body(httpd_req_t *req, char *body, size_t body_size)
+{
+    if (!body || body_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    body[0] = '\0';
+
+    size_t remaining = req->content_len;
+    size_t off = 0;
+
+    while (remaining > 0)
+    {
+        const size_t can_read = body_size - 1 - off;
+        if (can_read == 0)
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        int ret = httpd_req_recv(req, body + off, MIN(remaining, can_read));
+        if (ret <= 0)
+        {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+            {
+                continue;
+            }
+            return ESP_FAIL;
+        }
+
+        off += (size_t)ret;
+        remaining -= (size_t)ret;
+        server_bsp_mark_activity_internal();
+    }
+
+    body[off] = '\0';
+    server_bsp_trim_in_place(body);
+    return ESP_OK;
+}
+
+esp_err_t get_photos_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    const char *cur_path = server_bsp_get_current_image_path();
+    const char *cur_name = "";
+    if (cur_path && cur_path[0] != '\0')
+    {
+        const char *base = strrchr(cur_path, '/');
+        base = base ? (base + 1) : cur_path;
+        if (server_bsp_photo_name_is_safe(base)) {
+            cur_name = base;
+        }
+    }
+
+    // Stream JSON in chunks to avoid large fixed buffers and -Wformat-truncation warnings.
+    char pre[128] = {0};
+    snprintf(pre, sizeof(pre), "{\"rotation\":%u,\"image_rotation\":%u,\"current\":\"",
+             (unsigned)server_bsp_get_rotation(),
+             (unsigned)server_bsp_get_image_rotation());
+
+    httpd_resp_send_chunk(req, pre, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, cur_name, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, "\",\"photos\":[", HTTPD_RESP_USE_STRLEN);
+
+    DIR *dir = opendir(kUserPhotoDir);
+    bool first = true;
+    unsigned count = 0;
+
+    if (dir)
+    {
+        struct dirent *ent = NULL;
+        while ((ent = readdir(dir)) != NULL)
+        {
+            const char *name = ent->d_name;
+            if (!name || name[0] == '.') {
+                continue;
+            }
+            if (!server_bsp_photo_name_is_safe(name)) {
+                continue;
+            }
+
+            if (!first)
+            {
+                httpd_resp_send_chunk(req, ",", HTTPD_RESP_USE_STRLEN);
+            }
+
+            httpd_resp_send_chunk(req, "{\"name\":\"", HTTPD_RESP_USE_STRLEN);
+            httpd_resp_send_chunk(req, name, HTTPD_RESP_USE_STRLEN);
+            httpd_resp_send_chunk(req, "\"}", HTTPD_RESP_USE_STRLEN);
+
+            first = false;
+            count++;
+        }
+        closedir(dir);
+    }
+
+    char tail[64] = {0};
+    snprintf(tail, sizeof(tail), "],\"count\":%u}\n", count);
+    httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+esp_err_t post_photos_select_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    char name[128] = {0};
+    const esp_err_t body_err = server_bsp_recv_small_body(req, name, sizeof(name));
+    if (body_err == ESP_ERR_INVALID_SIZE)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_OK;
+    }
+    if (body_err != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+        return ESP_OK;
+    }
+
+    if (!server_bsp_photo_name_is_safe(name))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid file name");
+        return ESP_OK;
+    }
+
+    char full[192] = {0};
+    snprintf(full, sizeof(full), "%s/%s", kUserPhotoDir, name);
+
+    struct stat st = {};
+    if (stat(full, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_OK;
+    }
+
+    const uint16_t img_rot = server_bsp_parse_rotation_from_filename(name, s_rotation_deg);
+    server_bsp_set_current_image_internal(full, img_rot);
+
+    // Re-display selected image.
+    xEventGroupSetBits(server_groups, set_bit_button(2));
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char resp[256] = {0};
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"current\":\"%s\",\"image_rotation\":%u}\n",
+             name, (unsigned)img_rot);
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t post_photos_next_callback(httpd_req_t *req)
+{
+    (void)req;
+    server_bsp_mark_activity_internal();
+
+    esp_err_t err = server_bsp_select_next_photo();
+    if (err != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No photos");
+        return ESP_OK;
+    }
+
+    // Re-display newly selected image.
+    xEventGroupSetBits(server_groups, set_bit_button(2));
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    const char *cur_path = server_bsp_get_current_image_path();
+    const char *cur_name = "";
+    if (cur_path && cur_path[0] != '\0')
+    {
+        const char *base = strrchr(cur_path, '/');
+        cur_name = base ? (base + 1) : cur_path;
+    }
+
+    char resp[256] = {0};
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"current\":\"%s\"}\n", cur_name);
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t post_photos_delete_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    char name[128] = {0};
+    const esp_err_t body_err = server_bsp_recv_small_body(req, name, sizeof(name));
+    if (body_err == ESP_ERR_INVALID_SIZE)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_OK;
+    }
+    if (body_err != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+        return ESP_OK;
+    }
+
+    if (!server_bsp_photo_name_is_safe(name))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid file name");
+        return ESP_OK;
+    }
+
+    const char *cur_path = server_bsp_get_current_image_path();
+    const char *cur_base = "";
+    if (cur_path && cur_path[0] != '\0')
+    {
+        const char *base = strrchr(cur_path, '/');
+        cur_base = base ? (base + 1) : cur_path;
+    }
+    const bool deleting_current = (cur_base && strcmp(cur_base, name) == 0);
+
+    char full[192] = {0};
+    snprintf(full, sizeof(full), "%s/%s", kUserPhotoDir, name);
+
+    struct stat st = {};
+    if (stat(full, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_OK;
+    }
+
+    if (remove(full) != 0)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        return ESP_OK;
+    }
+
+    if (deleting_current)
+    {
+        // If we deleted the current image, pick a new one (if any remain).
+        esp_err_t sel_err = server_bsp_select_next_photo();
+        if (sel_err != ESP_OK)
+        {
+            server_bsp_set_current_image_internal("", s_rotation_deg);
+        }
+
+        xEventGroupSetBits(server_groups, set_bit_button(2));
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char resp[128] = {0};
+    snprintf(resp, sizeof(resp), "{\"ok\":true}\n");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 esp_err_t post_dataup_callback(httpd_req_t *req) {
     server_bsp_mark_activity_internal();
     char       *buf        = (char *) heap_caps_malloc(READ_LEN_MAX + 1, MALLOC_CAP_SPIRAM);
@@ -420,8 +920,32 @@ esp_err_t post_dataup_callback(httpd_req_t *req) {
     const char *uri        = req->uri;
     size_t      ret;
     ESP_LOGI("TAG", "用户POST的URI是:%s,字节:%d", uri, remaining);
-    xEventGroupSetBits(server_groups, set_bit_button(0)); 
-    sdcard_write_offset(kUserCurrentBmpPath, NULL, 0, 0);
+    xEventGroupSetBits(server_groups, set_bit_button(0));
+
+    // Generate a unique photo filename under /sdcard/user/current-img/
+    const uint16_t rot = server_bsp_get_rotation();
+
+    uint32_t seq = 0;
+    {
+        nvs_handle_t nvs = 0;
+        if (nvs_open(kNvsNamespace, NVS_READWRITE, &nvs) == ESP_OK)
+        {
+            nvs_get_u32(nvs, kNvsKeyPhotoSeq, &seq);
+            seq++;
+            nvs_set_u32(nvs, kNvsKeyPhotoSeq, seq);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        else
+        {
+            seq = (uint32_t)esp_timer_get_time();
+        }
+    }
+
+    char photo_path[192] = {0};
+    snprintf(photo_path, sizeof(photo_path), "%s/img_%06u_r%u.bmp", kUserPhotoDir, (unsigned)seq, (unsigned)rot);
+
+    sdcard_write_offset(photo_path, NULL, 0, 0);
     while (remaining > 0) {
         /* Read the data for the request */
         if ((ret = httpd_req_recv(req, buf, MIN(remaining, READ_LEN_MAX))) <= 0) {
@@ -431,27 +955,15 @@ esp_err_t post_dataup_callback(httpd_req_t *req) {
             }
             return ESP_FAIL;
         }
-        size_t req_len = sdcard_write_offset(kUserCurrentBmpPath, buf, ret, 1);
+        size_t req_len = sdcard_write_offset(photo_path, buf, ret, 1);
         sdcard_len += req_len; // Final comparison result
         remaining -= ret;      // Subtract the data that has already been received
         server_bsp_mark_activity_internal();
     }
     xEventGroupSetBits(server_groups, set_bit_button(1)); 
     if (sdcard_len == req->content_len) {
-        // Record the rotation that was active when this image was uploaded.
-        s_image_rotation_deg = server_bsp_get_rotation();
-        {
-            nvs_handle_t nvs = 0;
-            esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &nvs);
-            if (err == ESP_OK)
-            {
-                err = nvs_set_u16(nvs, kNvsKeyImageRotation, s_image_rotation_deg);
-                if (err == ESP_OK) {
-                    nvs_commit(nvs);
-                }
-                nvs_close(nvs);
-            }
-        }
+        // Current image becomes the newly uploaded photo.
+        server_bsp_set_current_image_internal(photo_path, rot);
 
         httpd_resp_send_chunk(req, "上传成功", strlen("上传成功"));
         xEventGroupSetBits(server_groups, set_bit_button(2));

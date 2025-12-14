@@ -9,6 +9,11 @@
   const rotLeftBtn = document.getElementById('rotLeft');
   const rotRightBtn = document.getElementById('rotRight');
 
+  const refreshPhotosBtn = document.getElementById('refreshPhotos');
+  const nextPhotoBtn = document.getElementById('nextPhoto');
+  const photoListEl = document.getElementById('photoList');
+  const photoCountEl = document.getElementById('photoCount');
+
   const previewCanvas = document.getElementById('preview');
   const previewCtx = previewCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -36,6 +41,155 @@
 
   function setStatus(msg) {
     statusEl.textContent = msg;
+  }
+
+  function clearElement(el) {
+    if (!el) return;
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+
+  function renderPhotoList(json) {
+    if (!photoListEl) return;
+
+    const photos = (json && Array.isArray(json.photos)) ? json.photos : [];
+    const current = (json && typeof json.current === 'string') ? json.current : '';
+
+    if (photoCountEl) {
+      const count = (json && typeof json.count === 'number') ? json.count : photos.length;
+      photoCountEl.textContent = `${count} photo(s) on SD. Current: ${current || '(none)'}`;
+    }
+
+    clearElement(photoListEl);
+
+    if (!photos.length) {
+      const li = document.createElement('li');
+      li.className = 'photo-item';
+      const span = document.createElement('span');
+      span.className = 'photo-name';
+      span.textContent = '(No photos yet)';
+      li.appendChild(span);
+      photoListEl.appendChild(li);
+      return;
+    }
+
+    for (const p of photos) {
+      const name = p && p.name;
+      if (!name) continue;
+
+      const li = document.createElement('li');
+      li.className = 'photo-item' + (name === current ? ' current' : '');
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'photo-name';
+      nameSpan.textContent = name;
+
+      const actions = document.createElement('span');
+      actions.className = 'photo-actions';
+
+      const showBtn = document.createElement('button');
+      showBtn.type = 'button';
+      showBtn.textContent = 'Show';
+      showBtn.addEventListener('click', () => selectPhoto(name));
+
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.textContent = 'Delete';
+      delBtn.addEventListener('click', () => deletePhoto(name));
+
+      actions.appendChild(showBtn);
+      actions.appendChild(delBtn);
+
+      li.appendChild(nameSpan);
+      li.appendChild(actions);
+      photoListEl.appendChild(li);
+    }
+  }
+
+  async function refreshPhotos() {
+    if (!photoListEl) return;
+
+    try {
+      const res = await fetch('/api/photos', { cache: 'no-store' });
+      const text = await res.text();
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${text}`);
+      }
+
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch (e) {
+        throw new Error(`Bad JSON from /api/photos: ${text}`);
+      }
+
+      renderPhotoList(json);
+    } catch (e) {
+      if (photoCountEl) photoCountEl.textContent = `Failed to load photos: ${String(e)}`;
+    }
+  }
+
+  async function selectPhoto(name) {
+    try {
+      setStatus(`Selecting ${name}...`);
+      const res = await fetch('/api/photos/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: String(name),
+      });
+
+      const text = await res.text();
+      if (!res.ok) {
+        setStatus(`Select failed (HTTP ${res.status}): ${text}`);
+        return;
+      }
+
+      await refreshPhotos();
+      setStatus(`Selected: ${name}`);
+    } catch (e) {
+      setStatus(`Select failed: ${String(e)}`);
+    }
+  }
+
+  async function deletePhoto(name) {
+    if (!confirm(`Delete ${name}?`)) return;
+
+    try {
+      setStatus(`Deleting ${name}...`);
+      const res = await fetch('/api/photos/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: String(name),
+      });
+
+      const text = await res.text();
+      if (!res.ok) {
+        setStatus(`Delete failed (HTTP ${res.status}): ${text}`);
+        return;
+      }
+
+      await refreshPhotos();
+      setStatus(`Deleted: ${name}`);
+    } catch (e) {
+      setStatus(`Delete failed: ${String(e)}`);
+    }
+  }
+
+  async function nextPhoto() {
+    try {
+      setStatus('Switching to next photo...');
+      const res = await fetch('/api/photos/next', { method: 'POST' });
+
+      const text = await res.text();
+      if (!res.ok) {
+        setStatus(`Next photo failed (HTTP ${res.status}): ${text}`);
+        return;
+      }
+
+      await refreshPhotos();
+      setStatus('Switched to next photo.');
+    } catch (e) {
+      setStatus(`Next photo failed: ${String(e)}`);
+    }
   }
 
   function normalizeRotation(deg) {
@@ -372,6 +526,9 @@
   if (rotLeftBtn) rotLeftBtn.addEventListener('click', () => stepRotation(-1));
   if (rotRightBtn) rotRightBtn.addEventListener('click', () => stepRotation(1));
 
+  if (refreshPhotosBtn) refreshPhotosBtn.addEventListener('click', () => refreshPhotos());
+  if (nextPhotoBtn) nextPhotoBtn.addEventListener('click', () => nextPhoto());
+
   fileEl.addEventListener('change', () => {
     uploadBtn.disabled = true;
 
@@ -429,6 +586,7 @@
 
       const text = await res.text();
       setStatus(`Server response: ${text}`);
+      await refreshPhotos();
     } catch (e) {
       setStatus(`Error: ${String(e)}`);
     } finally {
@@ -441,5 +599,6 @@
   (async () => {
     await loadRotationFromDevice();
     processLoadedImage();
+    await refreshPhotos();
   })();
 })();
