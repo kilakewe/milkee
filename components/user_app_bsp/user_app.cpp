@@ -282,7 +282,29 @@ static void BrowserImageUploadDisplayTask(void *arg)
 
     for (;;)
     {
-        EventBits_t bits = xEventGroupWaitBits(server_groups, set_bit_button(2), pdTRUE, pdFALSE, portMAX_DELAY);
+        // server_groups bits:
+        // 0: upload started
+        // 2: upload success (new image ready)
+        // 3: upload failed
+        const EventBits_t wait_mask = set_bit_button(0) | set_bit_button(2) | set_bit_button(3);
+        EventBits_t bits = xEventGroupWaitBits(server_groups, wait_mask, pdTRUE, pdFALSE, portMAX_DELAY);
+
+        if (get_bit_button(bits, 0))
+        {
+            // Start green blinking as soon as an image upload begins.
+            if (!Green_led_arg)
+            {
+                Green_led_arg = 1;
+                xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
+            }
+        }
+
+        if (get_bit_button(bits, 3))
+        {
+            // Upload failed; stop green blinking.
+            Green_led_arg = 0;
+        }
+
         if (!get_bit_button(bits, 2))
         {
             continue;
@@ -290,19 +312,24 @@ static void BrowserImageUploadDisplayTask(void *arg)
 
         if (pdTRUE == xSemaphoreTake(epaper_gui_semapHandle, pdMS_TO_TICKS(2000)))
         {
-            // Green LED blinks while drawing.
-            Green_led_arg = 1;
-            xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
+            // Keep green blinking while drawing.
+            if (!Green_led_arg)
+            {
+                Green_led_arg = 1;
+                xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
+            }
 
             // Re-init the paint buffer for the current rotation.
             // IMPORTANT: Paint_SetRotate() does not update Paint.Width/Paint.Height, so for 90/270
             // we must call Paint_NewImage() to swap the logical dimensions safely.
             const uint16_t rotation = server_bsp_get_rotation();
+            const uint16_t img_rotation = server_bsp_get_image_rotation();
             Paint_NewImage(epd_blackImage, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, rotation, EPD_7IN3E_WHITE);
             Paint_SetScale(6);
             Paint_SelectImage(epd_blackImage);
 
-            GUI_ReadBmp_RGB_6Color("/sdcard/user/current-img/user_send.bmp", 0, 0);
+            // If rotation changed after upload, rotate the current picture in software so it still fills the screen.
+            GUI_ReadBmp_RGB_6Color_Rotate("/sdcard/user/current-img/user_send.bmp", 0, 0, img_rotation, rotation);
             epaper_port_display(epd_blackImage);
 
             xSemaphoreGive(epaper_gui_semapHandle);
@@ -326,6 +353,12 @@ static void BrowserUploadIdleSleepTask(void *arg)
         if (last != 0 && now > last && (now - last) > kIdleTimeoutUs)
         {
             ESP_LOGI("browser_upload", "Idle for 10 minutes; entering deep sleep (wake on key button)");
+
+            // Stop status LEDs before sleeping.
+            Red_led_arg = 0;
+            Green_led_arg = 0;
+            led_set(LED_PIN_Red, LED_OFF);
+            led_set(LED_PIN_Green, LED_OFF);
 
             // Stop Wi-Fi before sleeping.
             set_espWifi_sleep();
@@ -436,6 +469,11 @@ uint8_t User_Mode_init(void)
     // Browser upload app
     Network_wifi_ap_init();
     http_server_init();
+
+    // Heartbeat: blink red LED while the device is awake.
+    Red_led_arg = 1;
+    xEventGroupSetBits(Red_led_Mode_queue, set_bit_button(6));
+
     xTaskCreate(BrowserImageUploadDisplayTask, "BrowserImageUploadDisplayTask", 6 * 1024, NULL, 2, NULL);
     xTaskCreate(BrowserUploadIdleSleepTask, "BrowserUploadIdleSleepTask", 4 * 1024, NULL, 2, NULL);
 

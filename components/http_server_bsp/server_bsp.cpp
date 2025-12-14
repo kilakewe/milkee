@@ -18,8 +18,10 @@ static const char *TAG = "server_bsp";
 
 static const char *kNvsNamespace = "BrowserUpload";
 static const char *kNvsKeyRotation = "rotation";
+static const char *kNvsKeyImageRotation = "image_rotation";
 
 static uint16_t s_rotation_deg = 180;
+static uint16_t s_image_rotation_deg = 180;
 static uint64_t s_last_activity_us = 0;
 static portMUX_TYPE s_activity_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -42,6 +44,11 @@ uint64_t server_bsp_get_last_activity_us(void)
 uint16_t server_bsp_get_rotation(void)
 {
     return s_rotation_deg;
+}
+
+uint16_t server_bsp_get_image_rotation(void)
+{
+    return s_image_rotation_deg;
 }
 
 esp_err_t server_bsp_set_rotation(uint16_t rotation_deg)
@@ -76,21 +83,38 @@ static void server_bsp_load_rotation_from_nvs(void)
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "NVS open failed (%s); using default rotation %u", esp_err_to_name(err), (unsigned)s_rotation_deg);
+        s_image_rotation_deg = s_rotation_deg;
         return;
     }
 
     uint16_t rot = 0;
-    err = nvs_get_u16(nvs, kNvsKeyRotation, &rot);
+    uint16_t img_rot = 0;
+
+    const esp_err_t err_rot = nvs_get_u16(nvs, kNvsKeyRotation, &rot);
+    const esp_err_t err_img = nvs_get_u16(nvs, kNvsKeyImageRotation, &img_rot);
+
     nvs_close(nvs);
 
-    if (err == ESP_OK && (rot == 0 || rot == 90 || rot == 180 || rot == 270))
+    if (err_rot == ESP_OK && (rot == 0 || rot == 90 || rot == 180 || rot == 270))
     {
         s_rotation_deg = rot;
         ESP_LOGI(TAG, "Loaded rotation from NVS: %u", (unsigned)s_rotation_deg);
-        return;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "No saved rotation in NVS; using default rotation %u", (unsigned)s_rotation_deg);
     }
 
-    ESP_LOGI(TAG, "No saved rotation in NVS; using default rotation %u", (unsigned)s_rotation_deg);
+    if (err_img == ESP_OK && (img_rot == 0 || img_rot == 90 || img_rot == 180 || img_rot == 270))
+    {
+        s_image_rotation_deg = img_rot;
+        ESP_LOGI(TAG, "Loaded image rotation from NVS: %u", (unsigned)s_image_rotation_deg);
+    }
+    else
+    {
+        // If no image rotation was saved yet, assume it matches the current rotation.
+        s_image_rotation_deg = s_rotation_deg;
+    }
 }
 
 // Static web UI is served from the SD card under:
@@ -414,6 +438,21 @@ esp_err_t post_dataup_callback(httpd_req_t *req) {
     }
     xEventGroupSetBits(server_groups, set_bit_button(1)); 
     if (sdcard_len == req->content_len) {
+        // Record the rotation that was active when this image was uploaded.
+        s_image_rotation_deg = server_bsp_get_rotation();
+        {
+            nvs_handle_t nvs = 0;
+            esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &nvs);
+            if (err == ESP_OK)
+            {
+                err = nvs_set_u16(nvs, kNvsKeyImageRotation, s_image_rotation_deg);
+                if (err == ESP_OK) {
+                    nvs_commit(nvs);
+                }
+                nvs_close(nvs);
+            }
+        }
+
         httpd_resp_send_chunk(req, "上传成功", strlen("上传成功"));
         xEventGroupSetBits(server_groups, set_bit_button(2));
     } 

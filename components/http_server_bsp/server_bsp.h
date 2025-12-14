@@ -21,6 +21,10 @@ uint16_t server_bsp_get_rotation(void);
 // Returns ESP_OK on success.
 esp_err_t server_bsp_set_rotation(uint16_t rotation_deg);
 
+// Rotation that was active when the last image was uploaded.
+// Used to rotate the *current* picture when the rotation setting changes.
+uint16_t server_bsp_get_image_rotation(void);
+
 // Last HTTP activity timestamp (microseconds from esp_timer_get_time).
 uint64_t server_bsp_get_last_activity_us(void);
 

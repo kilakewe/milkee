@@ -565,6 +565,160 @@ UBYTE GUI_ReadBmp_RGB_6Color(const char *path, UWORD Xstart, UWORD Ystart)
     return 0;
 #endif
 }
+
+static UWORD GUI_NormalizeRotate(UWORD Rotate)
+{
+    if (Rotate == ROTATE_0 || Rotate == ROTATE_90 || Rotate == ROTATE_180 || Rotate == ROTATE_270)
+    {
+        return Rotate;
+    }
+    return ROTATE_0;
+}
+
+UBYTE GUI_ReadBmp_RGB_6Color_Rotate(const char *path, UWORD Xstart, UWORD Ystart, UWORD srcRotate, UWORD dstRotate)
+{
+    FILE *fp;
+    BMPFILEHEADER bmpFileHeader;
+    BMPINFOHEADER bmpInfoHeader;
+
+    fp = fopen(path, "rb");
+    if (!fp) {
+        ESP_LOGE(TAG, "Can't open file: %s", path);
+        return 0;
+    }
+
+    if (fread(&bmpFileHeader, sizeof(BMPFILEHEADER), 1, fp) != 1 ||
+        fread(&bmpInfoHeader, sizeof(BMPINFOHEADER), 1, fp) != 1) {
+        ESP_LOGE(TAG, "Failed to read BMP header");
+        fclose(fp);
+        return 0;
+    }
+
+    if (bmpInfoHeader.biBitCount != 24) {
+        ESP_LOGE(TAG, "Bmp image is not 24-bit!");
+        fclose(fp);
+        return 0;
+    }
+
+    const UWORD width = (UWORD)bmpInfoHeader.biWidth;
+    const UWORD height = (UWORD)bmpInfoHeader.biHeight;
+    const int rowSize = ((width * 3 + 3) & ~3);
+
+    UBYTE *rowBuf = (UBYTE *)heap_caps_malloc(rowSize, MALLOC_CAP_SPIRAM);
+    UBYTE *Image = (UBYTE *)heap_caps_malloc((size_t)width * (size_t)height, MALLOC_CAP_SPIRAM);
+
+    if (!rowBuf || !Image) {
+        ESP_LOGE(TAG, "Memory allocation failed!");
+        if (rowBuf) heap_caps_free(rowBuf);
+        if (Image) heap_caps_free(Image);
+        fclose(fp);
+        return 0;
+    }
+
+    if (fseek(fp, bmpFileHeader.bOffset, SEEK_SET) != 0) {
+        ESP_LOGE(TAG, "fseek failed");
+        heap_caps_free(rowBuf);
+        heap_caps_free(Image);
+        fclose(fp);
+        return 0;
+    }
+
+    // Read rows (BMP bottom-up) into a top-down color-index image.
+    for (UWORD y = 0; y < height; y++) {
+        const size_t got = fread(rowBuf, 1, rowSize, fp);
+        if (got != (size_t)rowSize) {
+            ESP_LOGE(TAG, "BMP read error at line %u (got %zu, want %u)", (unsigned)y, got, (unsigned)rowSize);
+            break;
+        }
+
+        const UBYTE *p = rowBuf;
+        for (UWORD x = 0; x < width; x++) {
+            const UBYTE d0 = *p++; // Blue
+            const UBYTE d1 = *p++; // Green
+            const UBYTE d2 = *p++; // Red
+
+            UBYTE color;
+            if (d0 == 0 && d1 == 0 && d2 == 0) {
+                color = 0; // Black
+            } else if (d0 == 255 && d1 == 255 && d2 == 255) {
+                color = 1; // White
+            } else if (d0 == 0 && d1 == 255 && d2 == 255) {
+                color = 2; // Yellow
+            } else if (d0 == 0 && d1 == 0 && d2 == 255) {
+                color = 3; // Red
+            } else if (d0 == 255 && d1 == 0 && d2 == 0) {
+                color = 5; // Blue
+            } else if (d0 == 0 && d1 == 255 && d2 == 0) {
+                color = 6; // Green
+            } else {
+                color = 1; // Default white
+            }
+
+            Image[(size_t)(height - 1 - y) * (size_t)width + x] = color;
+        }
+    }
+
+    fclose(fp);
+
+    const int src = (int)GUI_NormalizeRotate(srcRotate);
+    const int dst = (int)GUI_NormalizeRotate(dstRotate);
+    int delta = (dst - src) % 360;
+    if (delta < 0) delta += 360;
+
+    UWORD outW = width;
+    UWORD outH = height;
+    if (delta == 90 || delta == 270) {
+        outW = height;
+        outH = width;
+    }
+
+    // Draw (rotating from src -> dst) into the current Paint coordinate system.
+    for (UWORD y = 0; y < outH; y++) {
+        if ((UWORD)(Ystart + y) >= Paint.Height) break;
+        for (UWORD x = 0; x < outW; x++) {
+            if ((UWORD)(Xstart + x) >= Paint.Width) break;
+
+            int sx = 0;
+            int sy = 0;
+
+            switch (delta) {
+            case 0:
+                sx = x;
+                sy = y;
+                break;
+            case 90:
+                // dest(x,y) = rotateCW(src, 90)
+                // src(x,y) = invRotateCW(dest, 90)
+                sx = (int)y;
+                sy = (int)height - 1 - (int)x;
+                break;
+            case 180:
+                sx = (int)width - 1 - (int)x;
+                sy = (int)height - 1 - (int)y;
+                break;
+            case 270:
+                sx = (int)width - 1 - (int)y;
+                sy = (int)x;
+                break;
+            default:
+                sx = x;
+                sy = y;
+                break;
+            }
+
+            if (sx < 0 || sy < 0 || sx >= (int)width || sy >= (int)height) {
+                continue;
+            }
+
+            const UBYTE color = Image[(size_t)sy * (size_t)width + (size_t)sx];
+            Paint_SetPixel(Xstart + x, Ystart + y, color);
+        }
+    }
+
+    heap_caps_free(rowBuf);
+    heap_caps_free(Image);
+    return 0;
+}
 #else
 
 UBYTE GUI_ReadBmp_RGB_6Color(const char *path, UWORD Xstart, UWORD Ystart)

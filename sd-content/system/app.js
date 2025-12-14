@@ -6,6 +6,8 @@
   const uploadBtn = document.getElementById('upload');
   const statusEl = document.getElementById('status');
   const rotationEl = document.getElementById('rotation');
+  const rotLeftBtn = document.getElementById('rotLeft');
+  const rotRightBtn = document.getElementById('rotRight');
 
   const previewCanvas = document.getElementById('preview');
   const previewCtx = previewCanvas.getContext('2d', { willReadFrequently: true });
@@ -335,7 +337,7 @@
     return buf;
   }
 
-  rotationEl.addEventListener('change', async () => {
+  async function applyRotationFromUi() {
     uploadBtn.disabled = true;
 
     const deg = getRotationDeg();
@@ -343,8 +345,32 @@
     const ok = await setRotationOnDevice(deg);
     if (!ok) return;
 
+    // If we don't have an image loaded in the browser, this still rotates the current picture on the device.
+    if (!loadedImage) {
+      setStatus(`Rotation set to ${deg}.`);
+      return;
+    }
+
+    // Re-render preview/work canvas for the new rotation.
     processLoadedImage();
-  });
+  }
+
+  function stepRotation(step) {
+    const order = [0, 90, 180, 270];
+    const current = getRotationDeg();
+    let idx = order.indexOf(current);
+    if (idx < 0) idx = 0;
+    idx = (idx + step + order.length) % order.length;
+
+    rotationEl.value = String(order[idx]);
+    // Trigger the normal handler.
+    applyRotationFromUi();
+  }
+
+  rotationEl.addEventListener('change', applyRotationFromUi);
+
+  if (rotLeftBtn) rotLeftBtn.addEventListener('click', () => stepRotation(-1));
+  if (rotRightBtn) rotRightBtn.addEventListener('click', () => stepRotation(1));
 
   fileEl.addEventListener('change', () => {
     uploadBtn.disabled = true;
