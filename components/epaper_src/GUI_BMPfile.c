@@ -687,18 +687,18 @@ UBYTE GUI_ReadBmp_RGB_6Color_Rotate(const char *path, UWORD Xstart, UWORD Ystart
                 sy = y;
                 break;
             case 90:
-                // dest(x,y) = rotateCW(src, 90)
-                // src(x,y) = invRotateCW(dest, 90)
-                sx = (int)y;
-                sy = (int)height - 1 - (int)x;
+                // Rotate clockwise 90: out(x,y) reads from src(height-1-y, x)
+                sx = (int)height - 1 - (int)y;
+                sy = (int)x;
                 break;
             case 180:
                 sx = (int)width - 1 - (int)x;
                 sy = (int)height - 1 - (int)y;
                 break;
             case 270:
-                sx = (int)width - 1 - (int)y;
-                sy = (int)x;
+                // Rotate clockwise 270 (= counter-clockwise 90): out(x,y) reads from src(y, width-1-x)
+                sx = (int)y;
+                sy = (int)width - 1 - (int)x;
                 break;
             default:
                 sx = x;
