@@ -328,11 +328,18 @@ static void BrowserImageUploadDisplayTask(void *arg)
             Paint_SetScale(6);
             Paint_SelectImage(epd_blackImage);
 
-            // If rotation changed after upload, rotate the current picture in software so it still fills the screen.
+            // Render the current picture.
+            // Note: Paint_NewImage(..., rotation, ...) controls how the framebuffer is rotated onto the panel.
+            // To avoid "canceling out" the frame rotation (e.g. 90 -> 270), only use the rotate helper to
+            // fix orientation *mismatches* (portrait vs landscape). Exact frame rotation differences are handled
+            // by Paint.Rotate.
+            const uint16_t dst_canvas = ((rotation == ROTATE_90) || (rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
+            const uint16_t src_canvas = ((img_rotation == ROTATE_90) || (img_rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
+
             const char *img_path = server_bsp_get_current_image_path();
             if (img_path && img_path[0] != '\0')
             {
-                GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, img_rotation, rotation);
+                GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, src_canvas, dst_canvas);
             }
             epaper_port_display(epd_blackImage);
 
@@ -342,11 +349,50 @@ static void BrowserImageUploadDisplayTask(void *arg)
     }
 }
 
+static void BrowserUploadRenderCurrentOnce(void)
+{
+    const uint32_t imagesize = ((EXAMPLE_LCD_WIDTH % 2 == 0) ? (EXAMPLE_LCD_WIDTH / 2)
+                                                             : (EXAMPLE_LCD_WIDTH / 2 + 1)) *
+                               EXAMPLE_LCD_HEIGHT;
+
+    uint8_t *epd_blackImage = (uint8_t *)heap_caps_malloc(imagesize * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
+    if (!epd_blackImage)
+    {
+        ESP_LOGE("browser_upload", "Failed to allocate e-paper buffer (%lu bytes)", (unsigned long)imagesize);
+        return;
+    }
+
+    if (pdTRUE == xSemaphoreTake(epaper_gui_semapHandle, pdMS_TO_TICKS(5000)))
+    {
+        const uint16_t rotation = server_bsp_get_rotation();
+        const uint16_t img_rotation = server_bsp_get_image_rotation();
+
+        Paint_NewImage(epd_blackImage, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, rotation, EPD_7IN3E_WHITE);
+        Paint_SetScale(6);
+        Paint_SelectImage(epd_blackImage);
+        Paint_Clear(EPD_7IN3E_WHITE);
+
+        const uint16_t dst_canvas = ((rotation == ROTATE_90) || (rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
+        const uint16_t src_canvas = ((img_rotation == ROTATE_90) || (img_rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
+
+        const char *img_path = server_bsp_get_current_image_path();
+        if (img_path && img_path[0] != '\0')
+        {
+            GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, src_canvas, dst_canvas);
+        }
+
+        epaper_port_display(epd_blackImage);
+        xSemaphoreGive(epaper_gui_semapHandle);
+    }
+
+    heap_caps_free(epd_blackImage);
+}
+
 static void BrowserUploadIdleSleepTask(void *arg)
 {
     (void)arg;
 
-    constexpr uint64_t kIdleTimeoutUs = 10ULL * 60ULL * 1000000ULL;
+    constexpr uint64_t kIdleTimeoutUs = 5ULL * 60ULL * 1000000ULL;
     constexpr gpio_num_t kWakeKeyPin = GPIO_NUM_4; // Key button (active-low)
 
     for (;;)
@@ -356,7 +402,7 @@ static void BrowserUploadIdleSleepTask(void *arg)
 
         if (last != 0 && now > last && (now - last) > kIdleTimeoutUs)
         {
-            ESP_LOGI("browser_upload", "Idle for 10 minutes; entering deep sleep (wake on key button)");
+            ESP_LOGI("browser_upload", "Idle for 5 minutes; entering deep sleep (wake on key button + optional timer)");
 
             // Stop status LEDs before sleeping.
             Red_led_arg = 0;
@@ -374,6 +420,13 @@ static void BrowserUploadIdleSleepTask(void *arg)
             ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ALL_LOW));
             ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
             ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
+
+            // If slideshow is enabled, also wake periodically by timer to advance photos.
+            if (server_bsp_get_slideshow_enabled())
+            {
+                const uint64_t interval_us = (uint64_t)server_bsp_get_slideshow_interval_s() * 1000000ULL;
+                ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(interval_us));
+            }
 
             vTaskDelay(pdMS_TO_TICKS(200));
             esp_deep_sleep_start();
@@ -407,6 +460,26 @@ static void key1_button_user_Task(void *arg)
                 nvs_commit(my_handle);
                 nvs_close(my_handle);
                 esp_restart();
+            }
+        }
+    }
+}
+
+// While awake, a single click on the key button should advance to the next photo.
+static void BrowserUploadKeyNextTask(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        // key_groups bit 0 is set by button_bsp on BTN_SINGLE_CLICK for USER_KEY_2 (GPIO 4).
+        const EventBits_t bits = xEventGroupWaitBits(key_groups, set_bit_button(0), pdTRUE, pdFALSE, portMAX_DELAY);
+        if (get_bit_button(bits, 0))
+        {
+            server_bsp_mark_activity();
+            if (server_bsp_select_next_photo() == ESP_OK)
+            {
+                xEventGroupSetBits(server_groups, set_bit_button(2));
             }
         }
     }
@@ -448,6 +521,41 @@ uint8_t User_Mode_init(void)
     if (sdcard_win == 0)
         return 0;
 
+    // Load rotation/slideshow/library state from NVS/SD.
+    server_bsp_init_state();
+
+    const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+
+    // Timer wake: if slideshow is enabled, advance one photo, refresh the panel, then sleep again.
+    if (wake == ESP_SLEEP_WAKEUP_TIMER && server_bsp_get_slideshow_enabled())
+    {
+        ESP_LOGI("browser_upload", "Woke from timer for slideshow; advancing photo and returning to sleep");
+        (void)server_bsp_select_next_photo();
+        BrowserUploadRenderCurrentOnce();
+
+        constexpr gpio_num_t kWakeKeyPin = GPIO_NUM_4; // Key button (active-low)
+
+        esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_AUTO);
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+        const uint64_t mask = 1ULL << kWakeKeyPin;
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ALL_LOW));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
+
+        const uint64_t interval_us = (uint64_t)server_bsp_get_slideshow_interval_s() * 1000000ULL;
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(interval_us));
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_deep_sleep_start();
+    }
+
+    // If we woke from deep sleep (key button), advance to the next stored photo.
+    if (wake == ESP_SLEEP_WAKEUP_EXT1)
+    {
+        (void)server_bsp_select_next_photo();
+    }
+
     Green_led_Mode_queue = xEventGroupCreate();
     Red_led_Mode_queue = xEventGroupCreate();
     epaper_groups = xEventGroupCreate();
@@ -466,6 +574,7 @@ uint8_t User_Mode_init(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_reset_pin(GPIO_NUM_4));
     button_Init();
     xTaskCreate(key1_button_user_Task, "key1_button_user_Task", 4 * 1024, NULL, 3, NULL);
+    xTaskCreate(BrowserUploadKeyNextTask, "BrowserUploadKeyNextTask", 4 * 1024, NULL, 3, NULL);
     xTaskCreate(Green_led_user_Task, "Green_led_user_Task", 3 * 1024, &Green_led_arg, 2, NULL);
     xTaskCreate(Red_led_user_Task, "Red_led_user_Task", 3 * 1024, &Red_led_arg, 2, NULL);
     xTaskCreate(axp2101_isCharging_task, "axp2101_isCharging_task", 3 * 1024, NULL, 2, NULL); // AXP2101 Charging
@@ -473,13 +582,6 @@ uint8_t User_Mode_init(void)
     // Browser upload app
     Network_wifi_ap_init();
     http_server_init();
-
-    // If we woke from deep sleep (key button), advance to the next stored photo.
-    const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
-    if (wake == ESP_SLEEP_WAKEUP_EXT1)
-    {
-        (void)server_bsp_select_next_photo();
-    }
 
     // Heartbeat: blink red LED while the device is awake.
     Red_led_arg = 1;

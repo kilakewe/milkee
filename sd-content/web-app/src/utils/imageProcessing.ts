@@ -75,6 +75,35 @@ export function cropAndResize(
   return ctx.getImageData(0, 0, targetWidth, targetHeight)
 }
 
+/**
+ * Resize to fit (contain) within target dimensions while preserving aspect ratio.
+ * The unused area is filled with white.
+ */
+export function fitAndResize(img: HTMLImageElement, targetWidth: number, targetHeight: number): ImageData {
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    throw new Error('Failed to get canvas context')
+  }
+
+  canvas.width = targetWidth
+  canvas.height = targetHeight
+
+  // White background for letterboxing.
+  ctx.fillStyle = '#FFFFFF'
+  ctx.fillRect(0, 0, targetWidth, targetHeight)
+
+  const scale = Math.min(targetWidth / img.width, targetHeight / img.height)
+  const dw = Math.round(img.width * scale)
+  const dh = Math.round(img.height * scale)
+  const dx = Math.round((targetWidth - dw) / 2)
+  const dy = Math.round((targetHeight - dh) / 2)
+
+  ctx.drawImage(img, 0, 0, img.width, img.height, dx, dy, dw, dh)
+
+  return ctx.getImageData(0, 0, targetWidth, targetHeight)
+}
+
 // 6-color palette for e-paper display
 const PALETTE = [
   { name: 'black', r: 0, g: 0, b: 0 },

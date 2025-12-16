@@ -5,6 +5,7 @@ import { api } from '@/services/api'
 
 const store = usePhotoFrameStore()
 const saving = ref(false)
+const savingSlideshow = ref(false)
 const savedMessage = ref(false)
 
 const rotationOptions = [
@@ -14,11 +15,39 @@ const rotationOptions = [
   { value: 270, label: '270° (Portrait Inverted)' },
 ]
 
+const slideshowEnabled = ref(false)
+const slideshowIntervalS = ref<number>(3600)
+
+const slideshowOptions = [
+  { value: 300, label: '5 minutes' },
+  { value: 600, label: '10 minutes' },
+  { value: 900, label: '15 minutes' },
+  { value: 1800, label: '30 minutes' },
+  { value: 3600, label: '1 hour' },
+  { value: 10800, label: '3 hours' },
+  { value: 21600, label: '6 hours' },
+  { value: 86400, label: '1 day' },
+  { value: 259200, label: '3 days' },
+  { value: 604800, label: '7 days' },
+]
+
+function flashSaved() {
+  savedMessage.value = true
+  setTimeout(() => {
+    savedMessage.value = false
+  }, 2000)
+}
+
 async function loadSettings() {
   try {
     store.setLoading(true)
-    const rotation = await api.getRotation()
+    store.clearError()
+
+    const [rotation, slideshow] = await Promise.all([api.getRotation(), api.getSlideshow()])
     store.setRotation(rotation)
+
+    slideshowEnabled.value = slideshow.enabled
+    slideshowIntervalS.value = slideshow.interval_s
   } catch (err) {
     store.setError(err instanceof Error ? err.message : 'Failed to load settings')
   } finally {
@@ -30,10 +59,7 @@ async function saveRotation() {
   try {
     saving.value = true
     await api.setRotation(store.rotation)
-    savedMessage.value = true
-    setTimeout(() => {
-      savedMessage.value = false
-    }, 2000)
+    flashSaved()
   } catch (err) {
     store.setError(err instanceof Error ? err.message : 'Failed to save rotation')
   } finally {
@@ -41,10 +67,32 @@ async function saveRotation() {
   }
 }
 
+async function saveSlideshow() {
+  try {
+    savingSlideshow.value = true
+    await api.setSlideshow({ enabled: slideshowEnabled.value, interval_s: slideshowIntervalS.value })
+    flashSaved()
+  } catch (err) {
+    store.setError(err instanceof Error ? err.message : 'Failed to save slideshow settings')
+  } finally {
+    savingSlideshow.value = false
+  }
+}
+
 function updateRotation(event: Event) {
   const value = parseInt((event.target as HTMLSelectElement).value)
   store.setRotation(value)
   saveRotation()
+}
+
+function updateSlideshowEnabled(event: Event) {
+  slideshowEnabled.value = (event.target as HTMLInputElement).checked
+  saveSlideshow()
+}
+
+function updateSlideshowInterval(event: Event) {
+  slideshowIntervalS.value = parseInt((event.target as HTMLSelectElement).value)
+  saveSlideshow()
 }
 
 onMounted(() => {
@@ -93,8 +141,39 @@ onMounted(() => {
       </section>
 
       <section class="setting-section">
-        <h2>Future Features</h2>
-        <p class="description disabled">Image rotation frequency (coming soon)</p>
+        <h2>Slideshow</h2>
+        <p class="description">Automatically rotate through photos while the frame is asleep.</p>
+
+        <div class="setting-control">
+          <label for="slideshow-enabled">Enable slideshow</label>
+          <input
+            id="slideshow-enabled"
+            type="checkbox"
+            :checked="slideshowEnabled"
+            :disabled="savingSlideshow"
+            @change="updateSlideshowEnabled"
+          />
+        </div>
+
+        <div class="setting-control">
+          <label for="slideshow-interval">Rotation interval</label>
+          <select
+            id="slideshow-interval"
+            :value="slideshowIntervalS"
+            @change="updateSlideshowInterval"
+            :disabled="savingSlideshow || !slideshowEnabled"
+          >
+            <option v-for="option in slideshowOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
+        </div>
+
+        <div class="info-box">
+          <strong>Status:</strong> {{ slideshowEnabled ? 'Enabled' : 'Disabled' }}
+          <br />
+          <strong>Interval (seconds):</strong> {{ slideshowIntervalS }}
+        </div>
       </section>
     </div>
   </div>

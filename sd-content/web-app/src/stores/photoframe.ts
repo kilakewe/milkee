@@ -2,21 +2,24 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 
 export interface Photo {
-  name: string
+  id: string
+  landscape: string
+  portrait: string
 }
 
+// Response shape from GET /api/photos
 export interface PhotoFrameState {
   rotation: number
-  image_rotation: number
   current: string
+  displaying: string
   photos: Photo[]
   count: number
 }
 
 export const usePhotoFrameStore = defineStore('photoframe', () => {
   const rotation = ref<number>(0)
-  const imageRotation = ref<number>(0)
-  const currentPhoto = ref<string>('')
+  const currentPhotoId = ref<string>('')
+  const displayingFilename = ref<string>('')
   const photos = ref<Photo[]>([])
   const isLoading = ref<boolean>(false)
   const error = ref<string | null>(null)
@@ -30,8 +33,8 @@ export const usePhotoFrameStore = defineStore('photoframe', () => {
 
   function setPhotoData(data: PhotoFrameState) {
     rotation.value = data.rotation
-    imageRotation.value = data.image_rotation
-    currentPhoto.value = data.current
+    currentPhotoId.value = data.current
+    displayingFilename.value = data.displaying
     photos.value = data.photos
   }
 
@@ -49,8 +52,8 @@ export const usePhotoFrameStore = defineStore('photoframe', () => {
 
   return {
     rotation,
-    imageRotation,
-    currentPhoto,
+    currentPhotoId,
+    displayingFilename,
     photos,
     isLoading,
     error,

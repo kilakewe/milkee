@@ -3,6 +3,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 extern EventGroupHandle_t server_groups;
@@ -35,9 +36,21 @@ esp_err_t server_bsp_select_next_photo(void);
 // Last HTTP activity timestamp (microseconds from esp_timer_get_time).
 uint64_t server_bsp_get_last_activity_us(void);
 
+// Manual activity marker (e.g. physical button press)
+void server_bsp_mark_activity(void);
+
+// Slideshow settings (NVS-backed)
+bool server_bsp_get_slideshow_enabled(void);
+uint32_t server_bsp_get_slideshow_interval_s(void);
+// Returns ESP_OK on success.
+esp_err_t server_bsp_set_slideshow(bool enabled, uint32_t interval_s);
+
+// Initialize SD/NVS-backed state without starting an HTTP server.
+// Safe to call multiple times.
+void server_bsp_init_state(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // !CLIENT_BSP_H
+#endif // !SERVER_BSP_H
