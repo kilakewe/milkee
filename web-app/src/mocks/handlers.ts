@@ -40,13 +40,13 @@ function allocateId(): string {
 
 export const handlers = [
   // Get rotation
-  http.get('/api/rotation', async () => {
+  http.get('*/api/rotation', async () => {
     await delay(200)
     return HttpResponse.json({ rotation: currentRotation })
   }),
 
   // Set rotation
-  http.post('/api/rotation', async ({ request }) => {
+  http.post('*/api/rotation', async ({ request }) => {
     await delay(300)
     const text = await request.text()
     const rotation = parseInt(text)
@@ -60,12 +60,12 @@ export const handlers = [
   }),
 
   // Slideshow settings
-  http.get('/api/slideshow', async () => {
+  http.get('*/api/slideshow', async () => {
     await delay(150)
     return HttpResponse.json({ enabled: slideshowEnabled, interval_s: slideshowIntervalS })
   }),
 
-  http.post('/api/slideshow', async ({ request }) => {
+  http.post('*/api/slideshow', async ({ request }) => {
     await delay(200)
 
     const body = (await request.json()) as { enabled?: unknown; interval_s?: unknown }
@@ -83,7 +83,7 @@ export const handlers = [
   }),
 
   // Get photos
-  http.get('/api/photos', async () => {
+  http.get('*/api/photos', async () => {
     await delay(200)
     return HttpResponse.json({
       rotation: currentRotation,
@@ -95,7 +95,7 @@ export const handlers = [
   }),
 
   // Select photo by id
-  http.post('/api/photos/select', async ({ request }) => {
+  http.post('*/api/photos/select', async ({ request }) => {
     await delay(200)
     const id = (await request.text()).trim()
 
@@ -109,7 +109,7 @@ export const handlers = [
   }),
 
   // Next photo
-  http.post('/api/photos/next', async () => {
+  http.post('*/api/photos/next', async () => {
     await delay(200)
 
     if (photos.length === 0) {
@@ -126,7 +126,7 @@ export const handlers = [
   }),
 
   // Delete photo
-  http.post('/api/photos/delete', async ({ request }) => {
+  http.post('*/api/photos/delete', async ({ request }) => {
     await delay(200)
     const id = (await request.text()).trim()
 
@@ -145,7 +145,7 @@ export const handlers = [
   }),
 
   // Reorder photos
-  http.post('/api/photos/reorder', async ({ request }) => {
+  http.post('*/api/photos/reorder', async ({ request }) => {
     await delay(200)
 
     const body = (await request.json()) as { order?: unknown }
@@ -177,7 +177,7 @@ export const handlers = [
   }),
 
   // Upload variant (raw BMP)
-  http.post('/api/photos/upload', async ({ request }) => {
+  http.post('*/api/photos/upload', async ({ request }) => {
     await delay(800)
 
     const url = new URL(request.url)

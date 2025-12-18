@@ -15,33 +15,52 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <div class="photo-grid">
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6">
     <div
       v-for="(photo, idx) in photos"
       :key="photo.id"
-      class="photo-card"
-      :class="{ current: photo.id === currentPhotoId }"
+      class="bg-white border-2 rounded-lg overflow-hidden transition-all hover:border-pf-primary hover:shadow-lg"
+      :class="photo.id === currentPhotoId ? 'border-pf-success bg-green-50' : 'border-gray-300'"
     >
-      <div class="photo-header">
-        <div class="photo-name" :title="photo.id">{{ photo.id }}</div>
-        <button @click="emit('delete', photo.id)" class="btn-delete" title="Delete photo">×</button>
+      <div 
+        class="flex justify-between items-center px-3 py-2 border-b"
+        :class="photo.id === currentPhotoId ? 'bg-green-100 border-green-200' : 'bg-gray-100 border-gray-300'"
+      >
+        <div class="text-sm font-medium text-gray-900 overflow-hidden overflow-ellipsis whitespace-nowrap" :title="photo.id">
+          {{ photo.id }}
+        </div>
+        <button 
+          @click="emit('delete', photo.id)" 
+          class="text-pf-danger text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-red-50 transition-colors touch-manipulation" 
+          title="Delete photo"
+        >
+          ×
+        </button>
       </div>
 
-      <div class="photo-placeholder">
-        <div class="variant-text">
-          <div class="variant-line" :title="photo.landscape"><strong>L:</strong> {{ photo.landscape || '—' }}</div>
-          <div class="variant-line" :title="photo.portrait"><strong>P:</strong> {{ photo.portrait || '—' }}</div>
+      <div class="aspect-[5/3] bg-gray-100 flex items-start justify-start p-3">
+        <div class="w-full text-xs text-gray-700">
+          <div class="overflow-hidden overflow-ellipsis whitespace-nowrap" :title="photo.landscape">
+            <strong>L:</strong> {{ photo.landscape || '—' }}
+          </div>
+          <div class="overflow-hidden overflow-ellipsis whitespace-nowrap mt-1" :title="photo.portrait">
+            <strong>P:</strong> {{ photo.portrait || '—' }}
+          </div>
         </div>
       </div>
 
-      <div class="photo-actions">
+      <div class="p-3">
         <template v-if="reorderMode">
-          <div class="reorder-row">
-            <button class="btn-secondary" @click="emit('move', photo.id, 'up')" :disabled="idx === 0">
+          <div class="flex gap-2 justify-end">
+            <button 
+              class="px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation" 
+              @click="emit('move', photo.id, 'up')" 
+              :disabled="idx === 0"
+            >
               ↑
             </button>
             <button
-              class="btn-secondary"
+              class="px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
               @click="emit('move', photo.id, 'down')"
               :disabled="idx === photos.length - 1"
             >
@@ -53,156 +72,16 @@ const emit = defineEmits<{
           <button
             v-if="photo.id !== currentPhotoId"
             @click="emit('select', photo.id)"
-            class="btn-select"
+            class="w-full px-4 py-2 bg-pf-primary text-white rounded-md font-medium hover:bg-pf-primary-hover transition-colors touch-manipulation"
           >
             Set as Current
           </button>
-          <div v-else class="current-badge">Current Photo</div>
+          <div v-else class="text-center px-4 py-2 bg-pf-success text-white rounded-md font-medium text-sm">
+            Current Photo
+          </div>
         </template>
       </div>
     </div>
   </div>
 </template>
 
-<style scoped>
-.photo-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 1.5rem;
-}
-
-.photo-card {
-  background: white;
-  border: 2px solid #e5e7eb;
-  border-radius: 0.5rem;
-  overflow: hidden;
-  transition: all 0.2s;
-}
-
-.photo-card:hover {
-  border-color: #3b82f6;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-}
-
-.photo-card.current {
-  border-color: #10b981;
-  background: #f0fdf4;
-}
-
-.photo-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.75rem;
-  background: #f9fafb;
-  border-bottom: 1px solid #e5e7eb;
-}
-
-.photo-card.current .photo-header {
-  background: #d1fae5;
-}
-
-.photo-name {
-  font-size: 0.875rem;
-  font-weight: 500;
-  color: #374151;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.btn-delete {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  color: #ef4444;
-  cursor: pointer;
-  padding: 0;
-  width: 2rem;
-  height: 2rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 0.25rem;
-  transition: background 0.2s;
-}
-
-.btn-delete:hover {
-  background: #fee;
-}
-
-.photo-placeholder {
-  aspect-ratio: 5/3;
-  background: #f3f4f6;
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-start;
-  padding: 0.75rem;
-}
-
-.variant-text {
-  width: 100%;
-  font-size: 0.75rem;
-  color: #374151;
-}
-
-.variant-line {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.variant-line + .variant-line {
-  margin-top: 0.25rem;
-}
-
-.reorder-row {
-  display: flex;
-  gap: 0.5rem;
-  justify-content: flex-end;
-}
-
-.btn-secondary {
-  padding: 0.5rem 0.75rem;
-  border: 1px solid #d1d5db;
-  border-radius: 0.375rem;
-  background: #f3f4f6;
-  color: #374151;
-  cursor: pointer;
-}
-
-.btn-secondary:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.photo-actions {
-  padding: 0.75rem;
-}
-
-.btn-select {
-  width: 100%;
-  padding: 0.5rem;
-  background: #3b82f6;
-  color: white;
-  border: none;
-  border-radius: 0.375rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.btn-select:hover {
-  background: #2563eb;
-}
-
-.current-badge {
-  text-align: center;
-  padding: 0.5rem;
-  background: #10b981;
-  color: white;
-  border-radius: 0.375rem;
-  font-weight: 500;
-  font-size: 0.875rem;
-}
-</style>

@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { usePhotoFrameStore } from '@/stores/photoframe'
+import { useToast } from '@/composables/useToast'
 import { api } from '@/services/api'
 import ImageUpload from '@/components/ImageUpload.vue'
 import PhotoGrid from '@/components/PhotoGrid.vue'
+import LoadingOverlay from '@/components/LoadingOverlay.vue'
 
 const store = usePhotoFrameStore()
+const toast = useToast()
 const showUpload = ref(false)
 
 const reorderMode = ref(false)
@@ -14,11 +17,10 @@ const orderDirty = ref(false)
 async function loadPhotos() {
   try {
     store.setLoading(true)
-    store.clearError()
     const data = await api.getPhotos()
     store.setPhotoData(data)
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to load photos')
+    toast.error('Failed to load photos', err instanceof Error ? err.message : undefined)
   } finally {
     store.setLoading(false)
   }
@@ -34,8 +36,9 @@ async function handleSelect(id: string) {
     store.setLoading(true)
     await api.selectPhoto(id)
     await loadPhotos()
+    toast.success('Photo selected', `Now displaying ${id}`)
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to select photo')
+    toast.error('Failed to select photo', err instanceof Error ? err.message : undefined)
     store.setLoading(false)
   }
 }
@@ -47,8 +50,9 @@ async function handleDelete(id: string) {
     store.setLoading(true)
     await api.deletePhoto(id)
     await loadPhotos()
+    toast.success('Photo deleted', `${id} has been removed`)
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to delete photo')
+    toast.error('Failed to delete photo', err instanceof Error ? err.message : undefined)
     store.setLoading(false)
   }
 }
@@ -58,8 +62,9 @@ async function handleNext() {
     store.setLoading(true)
     await api.nextPhoto()
     await loadPhotos()
+    toast.success('Next photo', 'Moved to next photo in rotation')
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to go to next photo')
+    toast.error('Failed to go to next photo', err instanceof Error ? err.message : undefined)
     store.setLoading(false)
   }
 }
@@ -93,7 +98,6 @@ async function cancelReorder() {
 async function saveReorder() {
   try {
     store.setLoading(true)
-    store.clearError()
 
     const order = store.photos.map((p) => p.id)
     await api.reorderPhotos(order)
@@ -101,8 +105,9 @@ async function saveReorder() {
     orderDirty.value = false
     reorderMode.value = false
     await loadPhotos()
+    toast.success('Order saved', 'Photos have been reordered')
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to save order')
+    toast.error('Failed to save order', err instanceof Error ? err.message : undefined)
   } finally {
     store.setLoading(false)
   }
@@ -114,47 +119,64 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="gallery-view">
-    <header class="header">
-      <div class="header-left">
-        <h1>PhotoFrame Gallery</h1>
-        <div v-if="store.currentPhotoId" class="subtext">
-          Current: <strong>{{ store.currentPhotoId }}</strong>
-          <span v-if="store.displayingFilename">(displaying: {{ store.displayingFilename }})</span>
+  <div class="max-w-7xl mx-auto p-4 md:p-8">
+    <div class="overflow-hidden rounded-lg bg-white shadow-sm relative">
+      <LoadingOverlay :loading="store.isLoading" />
+      <div class="px-4 py-5 sm:p-6">
+        <header class="flex flex-col md:flex-row md:justify-between md:items-start gap-4 mb-6 md:mb-8">
+      <div class="flex flex-col gap-1">
+        <h1 class="text-2xl md:text-3xl font-semibold text-pf-dark">PhotoFrame Gallery</h1>
+        <div v-if="store.currentPhotoId" class="text-sm text-pf-secondary">
+          Current: <strong class="text-pf-dark">{{ store.currentPhotoId }}</strong>
+          <span v-if="store.displayingFilename" class="hidden sm:inline">(displaying: {{ store.displayingFilename }})</span>
         </div>
       </div>
 
-      <div class="actions">
+      <div class="flex flex-wrap gap-2 md:gap-3">
         <template v-if="reorderMode">
-          <button @click="saveReorder" :disabled="store.isLoading || !orderDirty" class="btn-save">
+          <button
+            @click="saveReorder"
+            :disabled="store.isLoading || !orderDirty"
+            class="flex-1 sm:flex-none px-4 py-2 bg-pf-success text-white rounded-md font-medium hover:bg-pf-success-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors touch-manipulation"
+          >
             Save Order
           </button>
-          <button @click="cancelReorder" :disabled="store.isLoading" class="btn-cancel">Cancel</button>
+          <button
+            @click="cancelReorder"
+            :disabled="store.isLoading"
+            class="flex-1 sm:flex-none px-4 py-2 bg-gray-400 text-pf-dark rounded-md font-medium hover:bg-gray-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors touch-manipulation"
+          >
+            Cancel
+          </button>
         </template>
         <template v-else>
-          <button @click="handleNext" :disabled="store.isLoading || !store.hasPhotos" class="btn-next">
-            Next Photo
-          </button>
-          <button @click="startReorder" :disabled="store.isLoading || !store.hasPhotos" class="btn-reorder">
+
+          <button
+            @click="startReorder"
+            :disabled="store.isLoading || !store.hasPhotos"
+            class="flex-1 sm:flex-none px-4 py-2 bg-pf-secondary text-white rounded-md font-medium hover:bg-pf-secondary-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors touch-manipulation"
+          >
             Reorder
           </button>
-          <button @click="showUpload = true" :disabled="store.isLoading" class="btn-upload">
+          <button
+            @click="showUpload = true"
+            :disabled="store.isLoading"
+            class="flex-1 sm:flex-none px-4 py-2 bg-pf-primary text-white rounded-md font-medium hover:bg-pf-primary-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors touch-manipulation"
+          >
             Upload New
           </button>
         </template>
       </div>
     </header>
 
-    <div v-if="store.error" class="error">
-      {{ store.error }}
-      <button @click="store.clearError" class="btn-close">×</button>
-    </div>
-
-    <div v-if="store.isLoading" class="loading">Loading...</div>
-
-    <div v-if="!store.isLoading && !store.hasPhotos" class="empty-state">
-      <p>No photos yet. Upload your first image!</p>
-      <button @click="showUpload = true" class="btn-upload-large">Upload Image</button>
+    <div v-if="!store.hasPhotos" class="text-center py-16 px-4">
+      <p class="text-pf-secondary text-lg mb-6">No photos yet. Upload your first image!</p>
+      <button
+        @click="showUpload = true"
+        class="px-6 py-3 bg-pf-primary text-white rounded-md font-medium hover:bg-pf-primary-hover transition-colors touch-manipulation"
+      >
+        Upload Image
+      </button>
     </div>
 
     <PhotoGrid
@@ -167,173 +189,14 @@ onMounted(() => {
       @move="handleMove"
     />
 
-    <ImageUpload
-      v-if="showUpload"
-      :rotation="store.rotation"
-      @close="showUpload = false"
-      @complete="handleUploadComplete"
-    />
+        <ImageUpload
+          v-if="showUpload"
+          :rotation="store.rotation"
+          @close="showUpload = false"
+          @complete="handleUploadComplete"
+        />
+      </div>
+    </div>
   </div>
 </template>
 
-<style scoped>
-.gallery-view {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 2rem;
-}
-
-.header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 2rem;
-}
-
-.header-left {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.subtext {
-  font-size: 0.875rem;
-  color: #6b7280;
-}
-
-h1 {
-  font-size: 2rem;
-  font-weight: 600;
-  color: #1f2937;
-  margin: 0;
-}
-
-.actions {
-  display: flex;
-  gap: 1rem;
-}
-
-.btn-next,
-.btn-upload,
-.btn-reorder,
-.btn-save,
-.btn-cancel {
-  padding: 0.5rem 1rem;
-  border: none;
-  border-radius: 0.375rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.btn-next {
-  background: #6b7280;
-  color: white;
-}
-
-.btn-next:hover:not(:disabled) {
-  background: #4b5563;
-}
-
-.btn-reorder {
-  background: #f59e0b;
-  color: #111827;
-}
-
-.btn-reorder:hover:not(:disabled) {
-  background: #d97706;
-}
-
-.btn-upload {
-  background: #3b82f6;
-  color: white;
-}
-
-.btn-upload:hover:not(:disabled) {
-  background: #2563eb;
-}
-
-.btn-save {
-  background: #10b981;
-  color: white;
-}
-
-.btn-save:hover:not(:disabled) {
-  background: #059669;
-}
-
-.btn-cancel {
-  background: #f3f4f6;
-  color: #374151;
-}
-
-.btn-cancel:hover:not(:disabled) {
-  background: #e5e7eb;
-}
-
-.btn-next:disabled,
-.btn-upload:disabled,
-.btn-reorder:disabled,
-.btn-save:disabled,
-.btn-cancel:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.error {
-  background: #fee;
-  border: 1px solid #fcc;
-  color: #c00;
-  padding: 1rem;
-  border-radius: 0.375rem;
-  margin-bottom: 1rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.btn-close {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  cursor: pointer;
-  color: #c00;
-  padding: 0;
-  width: 2rem;
-  height: 2rem;
-}
-
-.loading {
-  text-align: center;
-  padding: 3rem;
-  color: #6b7280;
-  font-size: 1.125rem;
-}
-
-.empty-state {
-  text-align: center;
-  padding: 4rem 2rem;
-}
-
-.empty-state p {
-  color: #6b7280;
-  font-size: 1.125rem;
-  margin-bottom: 1.5rem;
-}
-
-.btn-upload-large {
-  padding: 0.75rem 1.5rem;
-  background: #3b82f6;
-  color: white;
-  border: none;
-  border-radius: 0.375rem;
-  font-size: 1rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.btn-upload-large:hover {
-  background: #2563eb;
-}
-</style>

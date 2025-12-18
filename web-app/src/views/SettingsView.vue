@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { usePhotoFrameStore } from '@/stores/photoframe'
+import { useToast } from '@/composables/useToast'
 import { api } from '@/services/api'
+import LoadingOverlay from '@/components/LoadingOverlay.vue'
 
 const store = usePhotoFrameStore()
+const toast = useToast()
 const saving = ref(false)
 const savingSlideshow = ref(false)
-const savedMessage = ref(false)
 
 const rotationOptions = [
   { value: 0, label: '0° (Landscape)' },
@@ -31,17 +33,9 @@ const slideshowOptions = [
   { value: 604800, label: '7 days' },
 ]
 
-function flashSaved() {
-  savedMessage.value = true
-  setTimeout(() => {
-    savedMessage.value = false
-  }, 2000)
-}
-
 async function loadSettings() {
   try {
     store.setLoading(true)
-    store.clearError()
 
     const [rotation, slideshow] = await Promise.all([api.getRotation(), api.getSlideshow()])
     store.setRotation(rotation)
@@ -49,7 +43,7 @@ async function loadSettings() {
     slideshowEnabled.value = slideshow.enabled
     slideshowIntervalS.value = slideshow.interval_s
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to load settings')
+    toast.error('Failed to load settings', err instanceof Error ? err.message : undefined)
   } finally {
     store.setLoading(false)
   }
@@ -59,9 +53,9 @@ async function saveRotation() {
   try {
     saving.value = true
     await api.setRotation(store.rotation)
-    flashSaved()
+    toast.success('Rotation saved', `Display orientation set to ${store.rotation}°`)
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to save rotation')
+    toast.error('Failed to save rotation', err instanceof Error ? err.message : undefined)
   } finally {
     saving.value = false
   }
@@ -71,9 +65,9 @@ async function saveSlideshow() {
   try {
     savingSlideshow.value = true
     await api.setSlideshow({ enabled: slideshowEnabled.value, interval_s: slideshowIntervalS.value })
-    flashSaved()
+    toast.success('Slideshow settings saved')
   } catch (err) {
-    store.setError(err instanceof Error ? err.message : 'Failed to save slideshow settings')
+    toast.error('Failed to save slideshow settings', err instanceof Error ? err.message : undefined)
   } finally {
     savingSlideshow.value = false
   }
@@ -101,204 +95,84 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="settings-view">
-    <header class="header">
-      <h1>Settings</h1>
-    </header>
+  <div class="max-w-4xl mx-auto p-4 md:p-8">
+    <div class="overflow-hidden rounded-lg bg-white shadow-sm relative">
+      <LoadingOverlay :loading="store.isLoading" />
+      <div class="px-4 py-5 sm:p-6">
+        <header class="mb-6 md:mb-8">
+          <h1 class="text-2xl md:text-3xl font-semibold text-pf-dark">Settings</h1>
+        </header>
 
-    <div v-if="store.error" class="error">
-      {{ store.error }}
-      <button @click="store.clearError" class="btn-close">×</button>
-    </div>
+        <div class="flex flex-col gap-6">
+          <section class="bg-gray-50 border border-gray-200 rounded-lg p-4 md:p-6">
+            <h2 class="text-xl font-semibold text-pf-dark mb-2">Display Orientation</h2>
+            <p class="text-pf-secondary text-sm mb-4 leading-relaxed">
+              Choose the rotation of your photoframe. This will affect both the display and how new
+              images should be cropped.
+            </p>
 
-    <div v-if="savedMessage" class="success">Settings saved successfully!</div>
+            <div class="flex flex-col gap-2 mb-4">
+              <label for="rotation" class="font-medium text-pf-secondary text-sm">Rotation</label>
+              <select 
+                id="rotation" 
+                :value="store.rotation" 
+                @change="updateRotation" 
+                :disabled="saving"
+                class="px-3 py-2 border border-gray-300 rounded-md bg-white text-pf-dark disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
+              >
+                <option v-for="option in rotationOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </div>
 
-    <div v-if="store.isLoading" class="loading">Loading...</div>
+            <div class="bg-blue-50 border border-blue-200 rounded-md p-3 text-sm text-pf-secondary">
+              <strong class="text-pf-dark">Current rotation:</strong> {{ store.rotation }}°
+              <br />
+              <strong class="text-pf-dark">Expected dimensions:</strong>
+              {{ store.rotation === 0 || store.rotation === 180 ? '800×480' : '480×800' }}
+            </div>
+          </section>
 
-    <div v-if="!store.isLoading" class="settings-content">
-      <section class="setting-section">
-        <h2>Display Orientation</h2>
-        <p class="description">
-          Choose the rotation of your photoframe. This will affect both the display and how new
-          images should be cropped.
-        </p>
+          <section class="bg-gray-50 border border-gray-200 rounded-lg p-4 md:p-6">
+            <h2 class="text-xl font-semibold text-pf-dark mb-2">Slideshow</h2>
+            <p class="text-pf-secondary text-sm mb-4 leading-relaxed">Automatically rotate through photos while the frame is asleep.</p>
 
-        <div class="setting-control">
-          <label for="rotation">Rotation</label>
-          <select id="rotation" :value="store.rotation" @change="updateRotation" :disabled="saving">
-            <option v-for="option in rotationOptions" :key="option.value" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
+            <div class="flex items-center gap-3 mb-4">
+              <input
+                id="slideshow-enabled"
+                type="checkbox"
+                :checked="slideshowEnabled"
+                :disabled="savingSlideshow"
+                @change="updateSlideshowEnabled"
+                class="w-5 h-5 rounded border-gray-300 text-pf-primary focus:ring-pf-primary disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
+              />
+              <label for="slideshow-enabled" class="font-medium text-pf-secondary text-sm">Enable slideshow</label>
+            </div>
+
+            <div class="flex flex-col gap-2 mb-4">
+              <label for="slideshow-interval" class="font-medium text-pf-secondary text-sm">Rotation interval</label>
+              <select
+                id="slideshow-interval"
+                :value="slideshowIntervalS"
+                @change="updateSlideshowInterval"
+                :disabled="savingSlideshow || !slideshowEnabled"
+                class="px-3 py-2 border border-gray-300 rounded-md bg-white text-pf-dark disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
+              >
+                <option v-for="option in slideshowOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </div>
+
+            <div class="bg-blue-50 border border-blue-200 rounded-md p-3 text-sm text-pf-secondary">
+              <strong class="text-pf-dark">Status:</strong> {{ slideshowEnabled ? 'Enabled' : 'Disabled' }}
+              <br />
+              <strong class="text-pf-dark">Interval (seconds):</strong> {{ slideshowIntervalS }}
+            </div>
+          </section>
         </div>
-
-        <div class="info-box">
-          <strong>Current rotation:</strong> {{ store.rotation }}°
-          <br />
-          <strong>Expected dimensions:</strong>
-          {{ store.rotation === 0 || store.rotation === 180 ? '800×480' : '480×800' }}
-        </div>
-      </section>
-
-      <section class="setting-section">
-        <h2>Slideshow</h2>
-        <p class="description">Automatically rotate through photos while the frame is asleep.</p>
-
-        <div class="setting-control">
-          <label for="slideshow-enabled">Enable slideshow</label>
-          <input
-            id="slideshow-enabled"
-            type="checkbox"
-            :checked="slideshowEnabled"
-            :disabled="savingSlideshow"
-            @change="updateSlideshowEnabled"
-          />
-        </div>
-
-        <div class="setting-control">
-          <label for="slideshow-interval">Rotation interval</label>
-          <select
-            id="slideshow-interval"
-            :value="slideshowIntervalS"
-            @change="updateSlideshowInterval"
-            :disabled="savingSlideshow || !slideshowEnabled"
-          >
-            <option v-for="option in slideshowOptions" :key="option.value" :value="option.value">
-              {{ option.label }}
-            </option>
-          </select>
-        </div>
-
-        <div class="info-box">
-          <strong>Status:</strong> {{ slideshowEnabled ? 'Enabled' : 'Disabled' }}
-          <br />
-          <strong>Interval (seconds):</strong> {{ slideshowIntervalS }}
-        </div>
-      </section>
+      </div>
     </div>
   </div>
 </template>
-
-<style scoped>
-.settings-view {
-  max-width: 800px;
-  margin: 0 auto;
-  padding: 2rem;
-}
-
-.header {
-  margin-bottom: 2rem;
-}
-
-h1 {
-  font-size: 2rem;
-  font-weight: 600;
-  color: #1f2937;
-  margin: 0;
-}
-
-.error {
-  background: #fee;
-  border: 1px solid #fcc;
-  color: #c00;
-  padding: 1rem;
-  border-radius: 0.375rem;
-  margin-bottom: 1rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.success {
-  background: #d1fae5;
-  border: 1px solid #a7f3d0;
-  color: #065f46;
-  padding: 1rem;
-  border-radius: 0.375rem;
-  margin-bottom: 1rem;
-}
-
-.btn-close {
-  background: none;
-  border: none;
-  font-size: 1.5rem;
-  cursor: pointer;
-  padding: 0;
-  width: 2rem;
-  height: 2rem;
-}
-
-.loading {
-  text-align: center;
-  padding: 3rem;
-  color: #6b7280;
-  font-size: 1.125rem;
-}
-
-.settings-content {
-  display: flex;
-  flex-direction: column;
-  gap: 2rem;
-}
-
-.setting-section {
-  background: white;
-  border: 1px solid #e5e7eb;
-  border-radius: 0.5rem;
-  padding: 1.5rem;
-}
-
-h2 {
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: #1f2937;
-  margin: 0 0 0.5rem 0;
-}
-
-.description {
-  color: #6b7280;
-  margin: 0 0 1.5rem 0;
-  line-height: 1.5;
-}
-
-.description.disabled {
-  opacity: 0.5;
-  font-style: italic;
-}
-
-.setting-control {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
-}
-
-label {
-  font-weight: 500;
-  color: #374151;
-}
-
-select {
-  padding: 0.5rem;
-  border: 1px solid #d1d5db;
-  border-radius: 0.375rem;
-  font-size: 1rem;
-  background: white;
-  cursor: pointer;
-}
-
-select:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.info-box {
-  background: #f3f4f6;
-  border: 1px solid #e5e7eb;
-  border-radius: 0.375rem;
-  padding: 1rem;
-  font-size: 0.875rem;
-  color: #4b5563;
-  line-height: 1.6;
-}
-</style>

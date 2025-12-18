@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@theme {
+  --color-pf-light: #d3ddde;
+  --color-pf-dark: #000f35;
+  --color-pf-primary: #0c27a9;
+  --color-pf-primary-hover: #091d7a;
+  --color-pf-secondary: #666dc6;
+  --color-pf-secondary-hover: #4f55a3;
+  --color-pf-info: #c4253e;
+  --color-pf-info-hover: #a21f33;
+  --color-pf-success: #009841;
+  --color-pf-success-hover: #007a34;
+  --color-pf-warning: #e9c400;
+  --color-pf-warning-hover: #d4b506;
+  --color-pf-danger: #ee002f;
+  --color-pf-danger-hover: #c4002a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+/* Touch target improvements for mobile */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  a,
+  input[type="button"],
+  input[type="submit"],
+  input[type="checkbox"],
+  input[type="radio"],
+  select {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}

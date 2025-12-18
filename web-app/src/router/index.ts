@@ -1,6 +1,7 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import GalleryView from '@/views/GalleryView.vue'
 import SettingsView from '@/views/SettingsView.vue'
+import ColorsDebugView from '@/views/ColorsDebugView.vue'
 
 const router = createRouter({
   // Hash routing works with the ESP32 static file server (no server-side history fallback needed).
@@ -15,6 +16,11 @@ const router = createRouter({
       path: '/settings',
       name: 'settings',
       component: SettingsView,
+    },
+    {
+      path: '/_debug/colours',
+      name: 'colors-debug',
+      component: ColorsDebugView,
     },
   ],
 })
