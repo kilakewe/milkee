@@ -57,6 +57,8 @@
 
 #include "esp_log.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_heap_caps.h"
 
@@ -551,13 +553,18 @@ UBYTE GUI_ReadBmp_RGB_6Color(const char *path, UWORD Xstart, UWORD Ystart)
     }
     fclose(fp);
    
-    // Refresh the image to the display buffer based on the displayed orientation
+    // Refresh the image to the display buffer based on the displayed orientation.
+    // Yield periodically to avoid starving lower-priority tasks / triggering the task watchdog.
     for(y = 0; y < bmpInfoHeader.biHeight; y++) {
+        if ((y % 16) == 0 && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
         for(x = 0; x < bmpInfoHeader.biWidth; x++) {
             if(x > Paint.Width || y > Paint.Height) {
                 break;
             }
             Paint_SetPixel(Xstart + x, Ystart + y, Image[bmpInfoHeader.biHeight *  bmpInfoHeader.biWidth - 1 -(bmpInfoHeader.biWidth-x-1+(y* bmpInfoHeader.biWidth))]);
+
 		}
     }
     heap_caps_free(Image);
@@ -673,7 +680,11 @@ UBYTE GUI_ReadBmp_RGB_6Color_Rotate(const char *path, UWORD Xstart, UWORD Ystart
     }
 
     // Draw (rotating from src -> dst) into the current Paint coordinate system.
+    // Yield periodically to avoid starving lower-priority tasks / triggering the task watchdog.
     for (UWORD y = 0; y < outH; y++) {
+        if ((y % 16) == 0 && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
         if ((UWORD)(Ystart + y) >= Paint.Height) break;
         for (UWORD x = 0; x < outW; x++) {
             if ((UWORD)(Xstart + x) >= Paint.Width) break;

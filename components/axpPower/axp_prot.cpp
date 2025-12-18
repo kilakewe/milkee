@@ -5,16 +5,26 @@
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "i2c_bsp.h"
 #include <stdio.h>
 
 const char *TAG = "axp2101";
 
 static XPowersPMU axp2101;
+static SemaphoreHandle_t s_axp_i2c_mutex = NULL;
 
 static int AXP2101_SLAVE_Read(uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint8_t len) {
+    (void)devAddr;
+
     int ret;
     uint8_t count = 3;
+
+    if (s_axp_i2c_mutex && xSemaphoreTake(s_axp_i2c_mutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        return -1;
+    }
+
     do
     {
         ret = (i2c_read_buff(axp2101_dev_handle, regAddr, data, len) == ESP_OK) ? 0 : -1;
@@ -23,12 +33,26 @@ static int AXP2101_SLAVE_Read(uint8_t devAddr, uint8_t regAddr, uint8_t *data, u
         vTaskDelay(pdMS_TO_TICKS(100));
         count--;
     } while (count);
+
+    if (s_axp_i2c_mutex)
+    {
+        xSemaphoreGive(s_axp_i2c_mutex);
+    }
+
     return ret;
 }
 
 static int AXP2101_SLAVE_Write(uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint8_t len) {
+    (void)devAddr;
+
     int ret;
     uint8_t count = 3;
+
+    if (s_axp_i2c_mutex && xSemaphoreTake(s_axp_i2c_mutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        return -1;
+    }
+
     do
     {
         ret = (i2c_write_buff(axp2101_dev_handle, regAddr, data, len) == ESP_OK) ? 0 : -1;
@@ -37,10 +61,21 @@ static int AXP2101_SLAVE_Write(uint8_t devAddr, uint8_t regAddr, uint8_t *data, 
         vTaskDelay(pdMS_TO_TICKS(100));
         count--;
     } while (count);
+
+    if (s_axp_i2c_mutex)
+    {
+        xSemaphoreGive(s_axp_i2c_mutex);
+    }
+
     return ret;
 }
 
 void axp_i2c_prot_init(void) {
+    if (!s_axp_i2c_mutex)
+    {
+        s_axp_i2c_mutex = xSemaphoreCreateMutex();
+    }
+
     if (axp2101.begin(AXP2101_SLAVE_ADDRESS, AXP2101_SLAVE_Read, AXP2101_SLAVE_Write)) {
         ESP_LOGI(TAG, "Init PMU SUCCESS!");
     } else {
@@ -185,6 +220,11 @@ void state_axp2101_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         ESP_LOGI(TAG, "\n\n");
     }
+}
+
+bool axp2101_is_charging(void)
+{
+    return axp2101.isCharging();
 }
 
 void axp2101_isCharging_task(void *arg) {

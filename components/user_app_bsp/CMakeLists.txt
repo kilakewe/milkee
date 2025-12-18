@@ -1,19 +1,15 @@
 idf_component_register(
-  SRCS 
-  "mode_src/xiaozhi_mode.cpp" 
-  "mode_src/Network_mode.cpp"
-  "mode_src/Basic_mode.cpp" 
-  "mode_src/Mode_Selection.cpp"
-  "user_app.cpp" 
-  PRIV_REQUIRES 
-  driver 
-  axpPower 
-  epaper_port 
-  epaper_src 
-  i2c_bsp 
-  led_bsp 
+  SRCS
+  "user_app.cpp"
+  PRIV_REQUIRES
+  driver
+  axpPower
+  epaper_port
+  epaper_src
+  i2c_bsp
+  led_bsp
   ListLib
-  sdcard_bsp  
+  sdcard_bsp
   button_bsp
   http_client_bsp
   json_bsp

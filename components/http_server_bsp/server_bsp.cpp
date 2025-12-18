@@ -46,6 +46,12 @@ static uint16_t s_rotation_deg = 180;
 static uint16_t s_image_rotation_deg = 180;
 static char s_current_image_path[192] = {0};
 static char s_current_photo_id[64] = {0};
+
+// When a new photo is uploaded in two steps (landscape + portrait), we may want to
+// wait until the preferred variant for the *current* frame orientation is present
+// before switching the display. This stores the in-progress new photo id.
+static char s_pending_new_photo_id[64] = {0};
+
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool s_slideshow_enabled = false;
@@ -891,6 +897,8 @@ static void server_bsp_set_current_photo_id_internal(const char *id)
 
     portENTER_CRITICAL(&s_state_mux);
     snprintf(s_current_photo_id, sizeof(s_current_photo_id), "%.*s", (int)sizeof(s_current_photo_id) - 1, safe);
+    // Switching the current photo resolves any pending "new upload" state.
+    s_pending_new_photo_id[0] = '\0';
     portEXIT_CRITICAL(&s_state_mux);
 
     server_bsp_save_current_photo_id_to_nvs(safe);
@@ -2339,24 +2347,59 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
     (void)server_bsp_write_library_to_sd_locked();
     xSemaphoreGive(s_library_mutex);
 
-    // Make the new photo current when created; otherwise refresh if this is the current ID.
+    // Decide whether to switch the display to this photo now.
+    // If the upload client sends landscape+portrait in two requests, we only switch
+    // immediately when the uploaded variant matches the frame's current orientation.
+    const bool want_portrait = (server_bsp_get_rotation() == 90 || server_bsp_get_rotation() == 270);
+    const bool uploaded_matches_orientation = (want_portrait && is_portrait) || (!want_portrait && is_landscape);
+
+    bool should_redraw = false;
+
     if (is_new)
     {
-        server_bsp_set_current_photo_id_internal(id);
+        if (uploaded_matches_orientation)
+        {
+            // Preferred variant arrived first; show it right away.
+            server_bsp_set_current_photo_id_internal(id);
+            should_redraw = true;
+        }
+        else
+        {
+            // Not the preferred variant for the current orientation; remember this ID
+            // and wait for the other variant upload before switching the display.
+            portENTER_CRITICAL(&s_state_mux);
+            snprintf(s_pending_new_photo_id, sizeof(s_pending_new_photo_id), "%.*s", (int)sizeof(s_pending_new_photo_id) - 1, id);
+            portEXIT_CRITICAL(&s_state_mux);
+        }
     }
     else
     {
         char cur_id[64] = {0};
+        char pending_id[64] = {0};
+
         portENTER_CRITICAL(&s_state_mux);
         snprintf(cur_id, sizeof(cur_id), "%.*s", (int)sizeof(cur_id) - 1, s_current_photo_id);
+        snprintf(pending_id, sizeof(pending_id), "%.*s", (int)sizeof(pending_id) - 1, s_pending_new_photo_id);
         portEXIT_CRITICAL(&s_state_mux);
+
         if (strcmp(cur_id, id) == 0)
         {
+            // Current photo got an updated variant; pick the correct one for rotation.
             server_bsp_update_current_image_for_rotation();
+            should_redraw = true;
+        }
+        else if (pending_id[0] != '\0' && strcmp(pending_id, id) == 0)
+        {
+            // Second half of a new upload just arrived; now we can switch and display.
+            server_bsp_set_current_photo_id_internal(id);
+            should_redraw = true;
         }
     }
 
-    xEventGroupSetBits(server_groups, set_bit_button(2));
+    if (should_redraw)
+    {
+        xEventGroupSetBits(server_groups, set_bit_button(2));
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");

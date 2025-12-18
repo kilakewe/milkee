@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "driver/rtc_io.h"
 #include "i2c_bsp.h"
 #include "led_bsp.h"
@@ -228,6 +229,74 @@ static void Green_led_user_Task(void *arg)
     }
 }
 
+// Red LED blink half-period (ms). While charging we slow this down.
+static volatile uint32_t s_red_led_blink_ms = 100;
+
+// Cached charging state for UI/indicators.
+static volatile bool s_is_charging = false;
+
+// Charging indicator redraw control.
+// NOTE: E-paper refresh is expensive (power + time). We rate-limit redraws triggered solely
+// by charging state changes to avoid reset/USB instability during frequent refreshes.
+// Use 32-bit milliseconds to avoid non-atomic 64-bit accesses on a 32-bit MCU.
+static volatile uint32_t s_last_epaper_refresh_ms = 0;
+static volatile bool s_charge_indicator_startup_pending = false;
+
+static inline bool IsChargingCached()
+{
+    return s_is_charging;
+}
+
+static inline void NoteEpaperRefreshedNow()
+{
+    s_last_epaper_refresh_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_charge_indicator_startup_pending = false;
+}
+
+static bool MaybeTriggerChargeIndicatorRedraw(void)
+{
+    // Only meaningful once the HTTP server/event group exists.
+    if (!server_groups)
+    {
+        return false;
+    }
+
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    // Let the system settle after boot before forcing an e-paper refresh.
+    constexpr uint32_t kBootDelayMs = 10U * 1000U;
+    if (now_ms < kBootDelayMs)
+    {
+        return false;
+    }
+
+    // Rate-limit charge-indicator-driven refreshes.
+    constexpr uint32_t kMinIntervalMs = 30U * 1000U;
+    const uint32_t last_ms = s_last_epaper_refresh_ms;
+    if (last_ms != 0 && (uint32_t)(now_ms - last_ms) < kMinIntervalMs)
+    {
+        return false;
+    }
+
+    // Note: Don't update s_last_epaper_refresh_ms here - it will be updated by
+    // NoteEpaperRefreshedNow() when the actual refresh completes.
+    s_charge_indicator_startup_pending = false;
+    xEventGroupSetBits(server_groups, set_bit_button(2));
+    return true;
+}
+
+static void DrawChargingCornerMarker10x10(void)
+{
+    if (!IsChargingCached())
+    {
+        return;
+    }
+
+    // Draw in the "logical" top-left of the current rotation.
+    constexpr UWORD kSize = 10;
+    Paint_ClearWindows(0, 0, kSize, kSize, EPD_7IN3E_YELLOW);
+}
+
 static void Red_led_user_Task(void *arg)
 {
     uint8_t *led_arg = (uint8_t *)arg;
@@ -244,13 +313,71 @@ static void Red_led_user_Task(void *arg)
         {
             while (*led_arg)
             {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                led_set(LED_PIN_Red, LED_OFF);
-                vTaskDelay(pdMS_TO_TICKS(100));
+                const uint32_t ms = (s_red_led_blink_ms < 50) ? 50 : s_red_led_blink_ms;
                 led_set(LED_PIN_Red, LED_ON);
+                vTaskDelay(pdMS_TO_TICKS(ms));
+                led_set(LED_PIN_Red, LED_OFF);
+                vTaskDelay(pdMS_TO_TICKS(ms));
             }
+            led_set(LED_PIN_Red, LED_OFF);
             xEventGroupClearBits(Red_led_Mode_queue, rset_bit_data(6));
         }
+    }
+}
+
+static void ChargingStatusLedTask(void *arg)
+{
+    (void)arg;
+
+    // Default: fast blink when awake.
+    constexpr uint32_t kBlinkFastMs = 100;
+    constexpr uint32_t kBlinkSlowMs = 1000;
+
+    // Debounce charging reads to avoid noisy I2C reads causing frequent redraws.
+    bool reported = IsChargingCached();
+    bool sample = reported;
+    int stable_count = 0;
+
+    for (;;)
+    {
+        // If we started while charging, schedule a single refresh later so the marker can appear,
+        // but avoid immediate boot-time refreshes.
+        if (s_charge_indicator_startup_pending)
+        {
+            (void)MaybeTriggerChargeIndicatorRedraw();
+        }
+
+        const bool charging = axp2101_is_charging();
+
+        // LED blink rate can follow the raw reading (doesn't require debouncing).
+        s_red_led_blink_ms = charging ? kBlinkSlowMs : kBlinkFastMs;
+
+        if (charging == sample)
+        {
+            stable_count++;
+        }
+        else
+        {
+            sample = charging;
+            stable_count = 1;
+        }
+
+        // Require two consecutive identical samples before updating state/UI.
+        if (stable_count >= 2 && sample != reported)
+        {
+            reported = sample;
+            s_is_charging = reported;
+
+            ESP_LOGI("charge", "charging=%d", (int)reported);
+
+            // Reset idle timer on state change.
+            server_bsp_mark_activity();
+
+            // Request a redraw (rate-limited) so the corner marker is added/removed.
+            (void)MaybeTriggerChargeIndicatorRedraw();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
 
@@ -341,7 +468,12 @@ static void BrowserImageUploadDisplayTask(void *arg)
             {
                 GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, src_canvas, dst_canvas);
             }
+
+            // Charging indicator overlay (drawn into the framebuffer).
+            DrawChargingCornerMarker10x10();
+
             epaper_port_display(epd_blackImage);
+            NoteEpaperRefreshedNow();
 
             xSemaphoreGive(epaper_gui_semapHandle);
             Green_led_arg = 0;
@@ -381,7 +513,11 @@ static void BrowserUploadRenderCurrentOnce(void)
             GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, src_canvas, dst_canvas);
         }
 
+        // Charging indicator overlay (drawn into the framebuffer).
+        DrawChargingCornerMarker10x10();
+
         epaper_port_display(epd_blackImage);
+        NoteEpaperRefreshedNow();
         xSemaphoreGive(epaper_gui_semapHandle);
     }
 
@@ -399,6 +535,14 @@ static void BrowserUploadIdleSleepTask(void *arg)
     {
         const uint64_t now = esp_timer_get_time();
         const uint64_t last = server_bsp_get_last_activity_us();
+
+        // While charging, keep the device awake so the charge indicator can be
+        // added/removed immediately and the USB/serial connection stays stable.
+        if (IsChargingCached())
+        {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
 
         if (last != 0 && now > last && (now - last) > kIdleTimeoutUs)
         {
@@ -508,8 +652,17 @@ uint8_t User_Mode_init(void)
     // axp2101_irq_init();                             /* AXP2101 Wakeup Settings */
     axp_i2c_prot_init(); /* AXP2101 Initialization */
     axp_cmd_init();      /* Enable the corresponding channel */
+
+    // Prime charging state early so the first draw after boot has the correct overlay.
+    s_is_charging = axp2101_is_charging();
+    // If we're charging at boot, request a single (delayed/rate-limited) refresh later
+    // so the corner marker can appear without forcing an immediate boot-time refresh.
+    s_charge_indicator_startup_pending = s_is_charging;
+
     led_init();          /* LED Blink Initialization */
     epaper_port_init();  /* Ink Display Initialization */
+
+    ESP_LOGI("reset", "esp_reset_reason=%d", (int)esp_reset_reason());
 
     // #if CONFIG_BOARD_TYPE_ESP32S3_PhotoPaint
     // Always render a 4x4 color-index test pattern (0x0..0xF) on boot for the PhotoPainter board.
@@ -525,6 +678,10 @@ uint8_t User_Mode_init(void)
     server_bsp_init_state();
 
     const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+
+    // Only refresh the e-paper at boot when the selected photo actually changed.
+    // E-paper retains its image without power, so a "cold" start usually does not require a refresh.
+    bool need_initial_render = false;
 
     // Timer wake: if slideshow is enabled, advance one photo, refresh the panel, then sleep again.
     if (wake == ESP_SLEEP_WAKEUP_TIMER && server_bsp_get_slideshow_enabled())
@@ -550,10 +707,11 @@ uint8_t User_Mode_init(void)
         esp_deep_sleep_start();
     }
 
-    // If we woke from deep sleep (key button), advance to the next stored photo.
+    // If we woke from deep sleep via a button, do NOT change the selected photo.
+    // The user can advance photos with a click while awake.
     if (wake == ESP_SLEEP_WAKEUP_EXT1)
     {
-        (void)server_bsp_select_next_photo();
+        // No-op.
     }
 
     Green_led_Mode_queue = xEventGroupCreate();
@@ -577,11 +735,18 @@ uint8_t User_Mode_init(void)
     xTaskCreate(BrowserUploadKeyNextTask, "BrowserUploadKeyNextTask", 4 * 1024, NULL, 3, NULL);
     xTaskCreate(Green_led_user_Task, "Green_led_user_Task", 3 * 1024, &Green_led_arg, 2, NULL);
     xTaskCreate(Red_led_user_Task, "Red_led_user_Task", 3 * 1024, &Red_led_arg, 2, NULL);
-    xTaskCreate(axp2101_isCharging_task, "axp2101_isCharging_task", 3 * 1024, NULL, 2, NULL); // AXP2101 Charging
+
+    // NOTE: Avoid running multiple PMU polling tasks concurrently; it can cause I2C errors/resets.
+    // If you want periodic PMU logging, re-enable this task (but keep it mutually exclusive with other PMU reads).
+    // xTaskCreate(axp2101_isCharging_task, "axp2101_isCharging_task", 3 * 1024, NULL, 2, NULL);
 
     // Browser upload app
     Network_wifi_ap_init();
     http_server_init();
+
+    // Charging state poller (controls LED blink + triggers redraw for corner marker).
+    // Start after http_server_init so server_groups is valid.
+    xTaskCreate(ChargingStatusLedTask, "ChargingStatusLedTask", 3 * 1024, NULL, 2, NULL);
 
     // Heartbeat: blink red LED while the device is awake.
     Red_led_arg = 1;
@@ -590,8 +755,12 @@ uint8_t User_Mode_init(void)
     xTaskCreate(BrowserImageUploadDisplayTask, "BrowserImageUploadDisplayTask", 6 * 1024, NULL, 2, NULL);
     xTaskCreate(BrowserUploadIdleSleepTask, "BrowserUploadIdleSleepTask", 4 * 1024, NULL, 2, NULL);
 
-    // Render the currently selected photo on startup.
-    xEventGroupSetBits(server_groups, set_bit_button(2));
+    // Only render on startup if something changed during boot.
+    // (Charging marker refresh is handled separately with a delayed/rate-limited request.)
+    if (need_initial_render)
+    {
+        xEventGroupSetBits(server_groups, set_bit_button(2));
+    }
 
     return 1;
 }
