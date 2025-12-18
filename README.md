@@ -57,7 +57,7 @@ Prerequisite: you must be in a working ESP‑IDF environment where `idf.py` work
 Milkee expects these paths on the SD card:
 
 - Web UI (served at `/`):
-  - `/sdcard/web-app/dist/`
+  - `/sdcard/web-app/`
 - Photo storage:
   - `/sdcard/user/current-img/`
 - Optional fallback images:
@@ -72,7 +72,7 @@ The web UI source lives in `sd-content/web-app/` (Vue + Vite).
    - `pnpm install`
    - `pnpm build`
 2. Copy the build output to the SD card:
-   - copy `sd-content/web-app/dist/` → `/sdcard/web-app/dist/`
+   - copy `sd-content/web-app/` → `/sdcard/web-app/`
 
 ## Connect to the device
 

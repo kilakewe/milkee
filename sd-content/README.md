@@ -5,14 +5,14 @@ This folder is meant to be copied onto the SD card root.
 The PhotoFrame web UI is the Vue app under `sd-content/web-app/`.
 
 Copy the build output to the SD card as:
-- `sd-content/web-app/dist/` -> `/web-app/dist/`
+- `sd-content/web-app/` -> `/web-app/`
 
 The firmware serves all HTTP `GET` requests from:
-- `/sdcard/web-app/dist`
+- `/sdcard/web-app`
 
 Examples:
-- `GET /` -> `/sdcard/web-app/dist/index.html`
-- `GET /assets/<file>` -> `/sdcard/web-app/dist/assets/<file>`
+- `GET /` -> `/sdcard/web-app/index.html`
+- `GET /assets/<file>` -> `/sdcard/web-app/assets/<file>`
 
 Note: the Vue app uses **hash routing** (e.g. `/#/settings`) so navigation works without any server-side SPA history fallback.
 
