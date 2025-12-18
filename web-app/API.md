@@ -73,6 +73,21 @@ Fields
 - `photos`: array of `{ "name": "..." }`.
 - `count`: number of photos.
 
+### `GET /api/photos/file/:filename`
+Serves a stored photo file.
+
+Request
+- URL parameter: filename (e.g. `img_000123_r180.bmp`)
+
+Behavior
+- Serves the BMP file from `/sdcard/user/current-img/` directory.
+- Validates filename for safety (no path traversal, must end with `.bmp`).
+
+Response
+- Content-Type: `image/bmp`
+- Body: raw BMP file data
+- On error: HTTP 404 if file not found, HTTP 400 if filename is invalid
+
 ### `POST /api/photos/select`
 Selects a stored photo as current.
 

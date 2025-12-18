@@ -94,6 +94,54 @@ export const handlers = [
     })
   }),
 
+  // Get photo file (returns a placeholder BMP image)
+  http.get('*/api/photos/file/:filename', async ({ params }) => {
+    await delay(100)
+    const filename = params.filename as string
+
+    // Validate filename format
+    if (!filename || !filename.endsWith('.bmp')) {
+      return new HttpResponse('Invalid filename', { status: 400 })
+    }
+
+    // Check if this file is referenced by any photo
+    const exists = photos.some((p) => p.landscape === filename || p.portrait === filename)
+    if (!exists) {
+      return new HttpResponse('Photo file not found', { status: 404 })
+    }
+
+    // Generate a minimal valid BMP (1x1 pixel, 24-bit color)
+    // BMP Header (14 bytes) + DIB Header (40 bytes) + pixel data (3 bytes + 1 padding)
+    const bmpData = new Uint8Array([
+      // BMP Header
+      0x42, 0x4d, // Signature 'BM'
+      0x3a, 0x00, 0x00, 0x00, // File size (58 bytes)
+      0x00, 0x00, 0x00, 0x00, // Reserved
+      0x36, 0x00, 0x00, 0x00, // Pixel data offset (54 bytes)
+      // DIB Header (BITMAPINFOHEADER)
+      0x28, 0x00, 0x00, 0x00, // Header size (40 bytes)
+      0x01, 0x00, 0x00, 0x00, // Width (1 pixel)
+      0x01, 0x00, 0x00, 0x00, // Height (1 pixel)
+      0x01, 0x00, // Color planes (1)
+      0x18, 0x00, // Bits per pixel (24)
+      0x00, 0x00, 0x00, 0x00, // Compression (none)
+      0x04, 0x00, 0x00, 0x00, // Image size (4 bytes)
+      0x13, 0x0b, 0x00, 0x00, // Horizontal resolution
+      0x13, 0x0b, 0x00, 0x00, // Vertical resolution
+      0x00, 0x00, 0x00, 0x00, // Colors in palette
+      0x00, 0x00, 0x00, 0x00, // Important colors
+      // Pixel data (BGR format) + padding
+      0x80, 0x80, 0x80, 0x00, // Gray pixel (B, G, R, padding)
+    ])
+
+    return new HttpResponse(bmpData, {
+      headers: {
+        'Content-Type': 'image/bmp',
+        'Cache-Control': 'public, max-age=3600',
+      },
+    })
+  }),
+
   // Select photo by id
   http.post('*/api/photos/select', async ({ request }) => {
     await delay(200)

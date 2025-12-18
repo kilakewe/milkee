@@ -1,5 +1,7 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import type { Photo } from '@/stores/photoframe'
+import { api } from '@/services/api'
 
 defineProps<{
   photos: Photo[]
@@ -12,6 +14,17 @@ const emit = defineEmits<{
   delete: [id: string]
   move: [id: string, direction: 'up' | 'down']
 }>()
+
+const imageErrors = ref<Set<string>>(new Set())
+
+function handleImageError(filename: string) {
+  imageErrors.value.add(filename)
+}
+
+function getPreferredImageFile(photo: Photo): string {
+  // Prefer landscape if available, fall back to portrait
+  return photo.landscape || photo.portrait || ''
+}
 </script>
 
 <template>
@@ -38,15 +51,33 @@ const emit = defineEmits<{
         </button>
       </div>
 
-      <div class="aspect-[5/3] bg-gray-100 flex items-start justify-start p-3">
-        <div class="w-full text-xs text-gray-700">
-          <div class="overflow-hidden overflow-ellipsis whitespace-nowrap" :title="photo.landscape">
-            <strong>L:</strong> {{ photo.landscape || '—' }}
+      <div class="aspect-[5/3] bg-gray-100 flex items-center justify-center overflow-hidden relative">
+        <template v-if="getPreferredImageFile(photo) && !imageErrors.has(getPreferredImageFile(photo))">
+          <img
+            :src="api.getPhotoFileUrl(getPreferredImageFile(photo))"
+            :alt="photo.id"
+            @error="handleImageError(getPreferredImageFile(photo))"
+            class="w-full h-full object-contain"
+            loading="lazy"
+          />
+        </template>
+        <template v-else>
+          <div class="w-full h-full flex items-center justify-center p-3">
+            <div class="w-full text-xs text-gray-500 text-center">
+              <div v-if="!photo.landscape && !photo.portrait">
+                No preview available
+              </div>
+              <div v-else class="space-y-1">
+                <div v-if="photo.landscape" class="overflow-hidden overflow-ellipsis whitespace-nowrap" :title="photo.landscape">
+                  <strong>L:</strong> {{ photo.landscape }}
+                </div>
+                <div v-if="photo.portrait" class="overflow-hidden overflow-ellipsis whitespace-nowrap" :title="photo.portrait">
+                  <strong>P:</strong> {{ photo.portrait }}
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="overflow-hidden overflow-ellipsis whitespace-nowrap mt-1" :title="photo.portrait">
-            <strong>P:</strong> {{ photo.portrait || '—' }}
-          </div>
-        </div>
+        </template>
       </div>
 
       <div class="p-3">

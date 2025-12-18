@@ -135,4 +135,9 @@ export const api = {
     if (!response.ok) throw new Error('Upload failed')
     return await response.json()
   },
+
+  getPhotoFileUrl(filename: string): string {
+    if (!filename) return ''
+    return `${API_BASE}/api/photos/file/${encodeURIComponent(filename)}`
+  },
 }

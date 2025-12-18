@@ -1191,6 +1191,7 @@ esp_err_t post_slideshow_callback(httpd_req_t *req);
 
 // Photo management API
 esp_err_t get_photos_callback(httpd_req_t *req);
+esp_err_t get_photos_file_callback(httpd_req_t *req);
 esp_err_t post_photos_select_callback(httpd_req_t *req);
 esp_err_t post_photos_next_callback(httpd_req_t *req);
 esp_err_t post_photos_delete_callback(httpd_req_t *req);
@@ -1341,6 +1342,11 @@ void http_server_init(void)
     uri_photos.uri = "/api/photos";
     uri_photos.method = HTTP_GET;
     uri_photos.handler = get_photos_callback;
+    httpd_register_uri_handler(server, &uri_photos);
+
+    uri_photos.uri = "/api/photos/file/*";
+    uri_photos.method = HTTP_GET;
+    uri_photos.handler = get_photos_file_callback;
     httpd_register_uri_handler(server, &uri_photos);
 
     uri_photos.uri = "/api/photos/select";
@@ -1885,6 +1891,50 @@ esp_err_t get_photos_callback(httpd_req_t *req)
     httpd_resp_send(req, text, HTTPD_RESP_USE_STRLEN);
     cJSON_free(text);
     return ESP_OK;
+}
+
+esp_err_t get_photos_file_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    // Extract filename from URI: /api/photos/file/filename.bmp -> filename.bmp
+    const char *uri = req->uri;
+    const char *prefix = "/api/photos/file/";
+    const size_t prefix_len = strlen(prefix);
+
+    if (strncmp(uri, prefix, prefix_len) != 0)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid URI");
+        return ESP_OK;
+    }
+
+    const char *filename = uri + prefix_len;
+
+    // Validate filename (no path traversal, must end with .bmp)
+    if (!server_bsp_photo_name_is_safe(filename))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid filename");
+        return ESP_OK;
+    }
+
+    // Build full path to the photo file
+    char sd_path[256] = {0};
+    snprintf(sd_path, sizeof(sd_path), "%s/%s", kUserPhotoDir, filename);
+
+    // Check if file exists
+    struct stat st = {};
+    if (stat(sd_path, &st) != 0 || !S_ISREG(st.st_mode))
+    {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Photo file not found");
+        return ESP_OK;
+    }
+
+    // Set content type for BMP
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");
+
+    // Serve the file
+    return server_bsp_send_sd_file(req, sd_path);
 }
 
 esp_err_t post_photos_select_callback(httpd_req_t *req)
