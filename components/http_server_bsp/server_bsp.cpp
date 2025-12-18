@@ -2481,10 +2481,13 @@ esp_err_t post_dataup_callback(httpd_req_t *req) {
 /*wifi ap init*/
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        server_bsp_mark_activity_internal();
         xEventGroupSetBits(server_groups, set_bit_button(4));
     } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        server_bsp_mark_activity_internal();
         xEventGroupSetBits(server_groups, set_bit_button(5));
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
+        server_bsp_mark_activity_internal();
     }
 }
 

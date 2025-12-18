@@ -31,11 +31,7 @@ extern SemaphoreHandle_t
 extern EventGroupHandle_t ai_IMG_Score_Group; 
 
 
-void User_Basic_mode_app_init(void);
-
-
-void User_Network_mode_app_init(void);
-
-void Mode_Selection_Init(void);
+// Legacy modes (voice assistant, basic mode, network mode, mode selection) are not used
+// by the PhotoPainter browser upload app.
 
 #endif
