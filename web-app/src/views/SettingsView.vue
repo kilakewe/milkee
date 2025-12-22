@@ -9,6 +9,7 @@ const store = usePhotoFrameStore()
 const toast = useToast()
 const saving = ref(false)
 const savingSlideshow = ref(false)
+const savingStatusIcons = ref(false)
 
 const rotationOptions = [
   { value: 0, label: '0° (Landscape)' },
@@ -19,6 +20,8 @@ const rotationOptions = [
 
 const slideshowEnabled = ref(false)
 const slideshowIntervalS = ref<number>(3600)
+
+const statusIconsEnabled = ref(false)
 
 const slideshowOptions = [
   { value: 300, label: '5 minutes' },
@@ -37,11 +40,17 @@ async function loadSettings() {
   try {
     store.setLoading(true)
 
-    const [rotation, slideshow] = await Promise.all([api.getRotation(), api.getSlideshow()])
+    const [rotation, slideshow, statusIcons] = await Promise.all([
+      api.getRotation(),
+      api.getSlideshow(),
+      api.getStatusIcons(),
+    ])
     store.setRotation(rotation)
 
     slideshowEnabled.value = slideshow.enabled
     slideshowIntervalS.value = slideshow.interval_s
+
+    statusIconsEnabled.value = statusIcons.enabled
   } catch (err) {
     toast.error('Failed to load settings', err instanceof Error ? err.message : undefined)
   } finally {
@@ -73,6 +82,18 @@ async function saveSlideshow() {
   }
 }
 
+async function saveStatusIcons() {
+  try {
+    savingStatusIcons.value = true
+    await api.setStatusIcons(statusIconsEnabled.value)
+    toast.success('Status icon setting saved')
+  } catch (err) {
+    toast.error('Failed to save status icon setting', err instanceof Error ? err.message : undefined)
+  } finally {
+    savingStatusIcons.value = false
+  }
+}
+
 function updateRotation(event: Event) {
   const value = parseInt((event.target as HTMLSelectElement).value)
   store.setRotation(value)
@@ -87,6 +108,11 @@ function updateSlideshowEnabled(event: Event) {
 function updateSlideshowInterval(event: Event) {
   slideshowIntervalS.value = parseInt((event.target as HTMLSelectElement).value)
   saveSlideshow()
+}
+
+function updateStatusIconsEnabled(event: Event) {
+  statusIconsEnabled.value = (event.target as HTMLInputElement).checked
+  saveStatusIcons()
 }
 
 onMounted(() => {
@@ -169,6 +195,25 @@ onMounted(() => {
               <strong class="text-pf-dark">Status:</strong> {{ slideshowEnabled ? 'Enabled' : 'Disabled' }}
               <br />
               <strong class="text-pf-dark">Interval (seconds):</strong> {{ slideshowIntervalS }}
+            </div>
+          </section>
+
+          <section class="bg-gray-50 border border-gray-200 rounded-lg p-4 md:p-6">
+            <h2 class="text-xl font-semibold text-pf-dark mb-2">On-frame status icons</h2>
+            <p class="text-pf-secondary text-sm mb-4 leading-relaxed">
+              Show battery + Wi‑Fi badges in the bottom-right corner. These only update when an image is refreshed.
+            </p>
+
+            <div class="flex items-center gap-3">
+              <input
+                id="status-icons-enabled"
+                type="checkbox"
+                :checked="statusIconsEnabled"
+                :disabled="savingStatusIcons"
+                @change="updateStatusIconsEnabled"
+                class="w-5 h-5 rounded border-gray-300 text-pf-primary focus:ring-pf-primary disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation"
+              />
+              <label for="status-icons-enabled" class="font-medium text-pf-secondary text-sm">Enable status icons overlay</label>
             </div>
           </section>
         </div>

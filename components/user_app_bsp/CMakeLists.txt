@@ -16,6 +16,7 @@ idf_component_register(
   nvs_flash
   esp_wifi
   http_server_bsp
+  qrcodegen
   audio_bsp
   esp32_ai_bsp
   main

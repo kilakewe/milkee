@@ -227,6 +227,30 @@ bool axp2101_is_charging(void)
     return axp2101.isCharging();
 }
 
+bool axp2101_is_discharging(void)
+{
+    return axp2101.isDischarge();
+}
+
+int axp2101_get_battery_percent(void)
+{
+    if (!axp2101.isBatteryConnect())
+    {
+        return -1;
+    }
+
+    const int pct = (int)axp2101.getBatteryPercent();
+    if (pct < 0)
+    {
+        return 0;
+    }
+    if (pct > 100)
+    {
+        return 100;
+    }
+    return pct;
+}
+
 int axp2101_get_batt_voltage_mv(void)
 {
     // XPowers returns millivolts.

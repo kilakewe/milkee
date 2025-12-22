@@ -10,11 +10,13 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "mdns.h"
 
 #include "ssid_manager.h"
 
@@ -45,6 +47,7 @@ static const char *kNvsKeyCurrentPhotoId = "cur_photo_id";
 static const char *kNvsKeyPhotoSeq = "photo_seq";
 static const char *kNvsKeySlideshowEnabled = "slideshow_en";
 static const char *kNvsKeySlideshowIntervalS = "slideshow_int_s";
+static const char *kNvsKeyStatusIcons = "status_icons";
 
 // Wi-Fi (PhotoFrame / browser upload app)
 // SoftAP defaults (used when no STA credentials, or when STA connect fails).
@@ -59,6 +62,64 @@ static constexpr int kStaMaxRetryCount = 10;
 // Lower peak Wi-Fi current draw by limiting TX power.
 // Units: 0.25 dBm. 56 => 14 dBm.
 static constexpr int8_t kWifiMaxTxPowerQuarterDbm = 56;
+
+// "Easy" host label for local discovery.
+// We set both:
+// - DHCP hostname (may resolve as http://frame-xxxxxx/ on some LANs)
+// - mDNS hostname (resolves as http://frame-xxxxxx.local/)
+static char s_frame_hostname[32] = {0};
+static bool s_mdns_started = false;
+
+static void server_bsp_init_frame_hostname_if_needed(void)
+{
+    if (s_frame_hostname[0] != '\0')
+    {
+        return;
+    }
+
+    uint8_t mac[6] = {0};
+#if CONFIG_IDF_TARGET_ESP32P4
+    (void)esp_wifi_get_mac(WIFI_IF_STA, mac);
+#else
+    (void)esp_read_mac(mac, ESP_MAC_WIFI_STA);
+#endif
+
+    // Use the last 3 bytes (6 hex chars) to keep the hostname short but unique.
+    // Example: frame-12ab34
+    snprintf(s_frame_hostname, sizeof(s_frame_hostname), "frame-%02x%02x%02x", mac[3], mac[4], mac[5]);
+}
+
+static void server_bsp_start_mdns_if_needed(void)
+{
+    server_bsp_init_frame_hostname_if_needed();
+    if (s_frame_hostname[0] == '\0')
+    {
+        return;
+    }
+
+    if (!s_mdns_started)
+    {
+        const esp_err_t err = mdns_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW("mdns", "mdns_init failed: %s", esp_err_to_name(err));
+            return;
+        }
+
+        // Advertise HTTP service (best-effort).
+        const esp_err_t serr = mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+        if (serr != ESP_OK && serr != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW("mdns", "mdns_service_add failed: %s", esp_err_to_name(serr));
+        }
+
+        s_mdns_started = true;
+    }
+
+    // Best-effort: update hostname/instance each time in case Wi-Fi was restarted.
+    (void)mdns_hostname_set(s_frame_hostname);
+    (void)mdns_instance_name_set(s_frame_hostname);
+}
 
 enum class ServerWifiMode {
     NONE = 0,
@@ -115,6 +176,9 @@ static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_slideshow_enabled = false;
 static uint32_t s_slideshow_interval_s = 3600;
 
+// UI preference: overlay status icons on the rendered photo.
+static uint8_t s_status_icons = 0;
+
 struct LibraryPhoto
 {
     std::string id;
@@ -164,6 +228,83 @@ uint64_t server_bsp_get_last_activity_us(void)
 void server_bsp_mark_activity(void)
 {
     server_bsp_mark_activity_internal();
+}
+
+const char *server_bsp_get_ap_ip(void)
+{
+    return "192.168.4.1";
+}
+
+void server_bsp_get_network_info(server_bsp_network_info_t *out)
+{
+    if (!out)
+    {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    server_bsp_init_frame_hostname_if_needed();
+    snprintf(out->hostname, sizeof(out->hostname), "%s", s_frame_hostname);
+
+    ServerWifiMode mode = ServerWifiMode::NONE;
+    bool sta_connected = false;
+    char sta_ssid[33] = {0};
+    char sta_ip[16] = {0};
+    char ap_ssid[33] = {0};
+
+    portENTER_CRITICAL(&s_wifi_mux);
+    mode = s_wifi_mode;
+    sta_connected = s_sta_connected;
+    snprintf(sta_ssid, sizeof(sta_ssid), "%s", s_sta_ssid);
+    snprintf(sta_ip, sizeof(sta_ip), "%s", s_sta_ip);
+    snprintf(ap_ssid, sizeof(ap_ssid), "%s", s_ap_ssid);
+    portEXIT_CRITICAL(&s_wifi_mux);
+
+    switch (mode)
+    {
+    case ServerWifiMode::STA:
+        out->mode = SERVER_BSP_WIFI_MODE_STA;
+        break;
+    case ServerWifiMode::AP:
+        out->mode = SERVER_BSP_WIFI_MODE_AP;
+        break;
+    default:
+        out->mode = SERVER_BSP_WIFI_MODE_NONE;
+        break;
+    }
+
+    out->sta_connected = sta_connected;
+    snprintf(out->sta_ssid, sizeof(out->sta_ssid), "%s", sta_ssid);
+    snprintf(out->sta_ip, sizeof(out->sta_ip), "%s", sta_ip);
+    snprintf(out->ap_ssid, sizeof(out->ap_ssid), "%s", ap_ssid[0] ? ap_ssid : kApSsidDefault);
+    snprintf(out->ap_password, sizeof(out->ap_password), "%s", kApPassDefault);
+}
+
+bool server_bsp_get_status_icons_enabled(void)
+{
+    return (s_status_icons != 0);
+}
+
+esp_err_t server_bsp_set_status_icons_enabled(bool enabled)
+{
+    s_status_icons = enabled ? 1 : 0;
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &nvs);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = nvs_set_u8(nvs, kNvsKeyStatusIcons, s_status_icons);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(nvs);
+    }
+
+    nvs_close(nvs);
+    return err;
 }
 
 uint16_t server_bsp_get_rotation(void)
@@ -1092,6 +1233,7 @@ static void server_bsp_load_state_from_nvs(void)
 
         s_slideshow_enabled = false;
         s_slideshow_interval_s = 3600;
+        s_status_icons = 0;
 
         portENTER_CRITICAL(&s_state_mux);
         s_current_photo_id[0] = '\0';
@@ -1105,6 +1247,7 @@ static void server_bsp_load_state_from_nvs(void)
     uint16_t img_rot = 0;
     uint8_t slideshow_en_u8 = 0;
     uint32_t slideshow_interval_s = 0;
+    uint8_t status_icons_u8 = 0;
 
     const esp_err_t err_rot = nvs_get_u16(nvs, kNvsKeyRotation, &rot);
     const esp_err_t err_img = nvs_get_u16(nvs, kNvsKeyImageRotation, &img_rot);
@@ -1117,6 +1260,8 @@ static void server_bsp_load_state_from_nvs(void)
 
     const esp_err_t err_sl_en = nvs_get_u8(nvs, kNvsKeySlideshowEnabled, &slideshow_en_u8);
     const esp_err_t err_sl_int = nvs_get_u32(nvs, kNvsKeySlideshowIntervalS, &slideshow_interval_s);
+
+    const esp_err_t err_icons = nvs_get_u8(nvs, kNvsKeyStatusIcons, &status_icons_u8);
 
     nvs_close(nvs);
 
@@ -1165,6 +1310,15 @@ static void server_bsp_load_state_from_nvs(void)
     if (err_sl_int == ESP_OK && server_bsp_slideshow_interval_is_allowed(slideshow_interval_s))
     {
         s_slideshow_interval_s = slideshow_interval_s;
+    }
+
+    if (err_icons == ESP_OK)
+    {
+        s_status_icons = status_icons_u8;
+    }
+    else
+    {
+        s_status_icons = 0;
     }
 }
 
@@ -1251,6 +1405,10 @@ esp_err_t post_rotation_callback(httpd_req_t *req);
 // Slideshow settings API
 esp_err_t get_slideshow_callback(httpd_req_t *req);
 esp_err_t post_slideshow_callback(httpd_req_t *req);
+
+// Status icon overlay API
+esp_err_t get_status_icons_callback(httpd_req_t *req);
+esp_err_t post_status_icons_callback(httpd_req_t *req);
 
 // Photo management API
 esp_err_t get_photos_callback(httpd_req_t *req);
@@ -1371,7 +1529,7 @@ void http_server_init(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     // We register more than the HTTPD_DEFAULT_CONFIG() handler limit.
     // If this stays too low, later registrations will fail and uploads will 404.
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 28;
     config.uri_match_fn = httpd_uri_match_wildcard; /*Wildcard enabling*/
     ESP_ERROR_CHECK(httpd_start(&server, &config));
 
@@ -1421,6 +1579,18 @@ void http_server_init(void)
     uri_slide.method = HTTP_POST;
     uri_slide.handler = post_slideshow_callback;
     httpd_register_uri_handler(server, &uri_slide);
+
+    // Status icon overlay API
+    httpd_uri_t uri_icons = {};
+    uri_icons.uri = "/api/status_icons";
+    uri_icons.user_ctx = NULL;
+    uri_icons.method = HTTP_GET;
+    uri_icons.handler = get_status_icons_callback;
+    httpd_register_uri_handler(server, &uri_icons);
+
+    uri_icons.method = HTTP_POST;
+    uri_icons.handler = post_status_icons_callback;
+    httpd_register_uri_handler(server, &uri_icons);
 
     // Photo management API
     httpd_uri_t uri_photos = {};
@@ -1962,6 +2132,63 @@ esp_err_t post_slideshow_callback(httpd_req_t *req)
     snprintf(resp, sizeof(resp), "{\"enabled\":%s,\"interval_s\":%u}\n",
              server_bsp_get_slideshow_enabled() ? "true" : "false",
              (unsigned)server_bsp_get_slideshow_interval_s());
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t get_status_icons_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char resp[64] = {0};
+    snprintf(resp, sizeof(resp), "{\"enabled\":%s}\n", server_bsp_get_status_icons_enabled() ? "true" : "false");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t post_status_icons_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    char body[64] = {0};
+    const esp_err_t body_err = server_bsp_recv_small_body(req, body, sizeof(body));
+    if (body_err == ESP_ERR_INVALID_SIZE)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_OK;
+    }
+    if (body_err != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+
+    const cJSON *jen = cJSON_GetObjectItem(root, "enabled");
+    const bool enabled = cJSON_IsTrue(jen) || (cJSON_IsNumber(jen) && jen->valuedouble != 0);
+    cJSON_Delete(root);
+
+    const esp_err_t err = server_bsp_set_status_icons_enabled(enabled);
+    if (err != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save setting");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char resp[64] = {0};
+    snprintf(resp, sizeof(resp), "{\"enabled\":%s}\n", server_bsp_get_status_icons_enabled() ? "true" : "false");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2996,6 +3223,9 @@ static void wifi_sta_got_ip_handler(void *arg, esp_event_base_t event_base, int3
 
     server_bsp_mark_activity_internal();
 
+    // Advertise http://frame-xxxxxx.local/ via mDNS once we're on the LAN.
+    server_bsp_start_mdns_if_needed();
+
     if (s_wifi_event_group)
     {
         xEventGroupSetBits(s_wifi_event_group, WIFI_STA_CONNECTED_BIT);
@@ -3105,6 +3335,12 @@ static void server_bsp_start_softap(void)
     {
         ESP_LOGE("network", "esp_netif_create_default_wifi_ap failed (NULL)");
         return;
+    }
+
+    server_bsp_init_frame_hostname_if_needed();
+    if (s_frame_hostname[0] != '\0')
+    {
+        (void)esp_netif_set_hostname(s_ap_netif, s_frame_hostname);
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -3228,6 +3464,17 @@ static bool server_bsp_try_connect_sta(const char *ssid, const char *password, i
     {
         ESP_LOGE("network", "esp_netif_create_default_wifi_sta failed (NULL)");
         return false;
+    }
+
+    // Set DHCP hostname so some LANs can resolve http://frame-xxxxxx/.
+    server_bsp_init_frame_hostname_if_needed();
+    if (s_frame_hostname[0] != '\0')
+    {
+        const esp_err_t herr = esp_netif_set_hostname(s_sta_netif, s_frame_hostname);
+        if (herr != ESP_OK)
+        {
+            ESP_LOGW("network", "esp_netif_set_hostname(%s) failed: %s", s_frame_hostname, esp_err_to_name(herr));
+        }
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();

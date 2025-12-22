@@ -12,6 +12,7 @@ const ALLOWED_INTERVALS = new Set([300, 600, 900, 1800, 3600, 10800, 21600, 8640
 let currentRotation = 180
 let slideshowEnabled = false
 let slideshowIntervalS = 3600
+let statusIconsEnabled = false
 
 let photos: Photo[] = [
   { id: 'img_000001', landscape: 'img_000001_L_r0.bmp', portrait: 'img_000001_P_r90.bmp' },
@@ -80,6 +81,24 @@ export const handlers = [
     slideshowIntervalS = interval_s
 
     return HttpResponse.json({ enabled: slideshowEnabled, interval_s: slideshowIntervalS })
+  }),
+
+  // Status icon overlay setting
+  http.get('*/api/status_icons', async () => {
+    await delay(120)
+    return HttpResponse.json({ enabled: statusIconsEnabled })
+  }),
+
+  http.post('*/api/status_icons', async ({ request }) => {
+    await delay(160)
+
+    const body = (await request.json()) as { enabled?: unknown }
+    if (typeof body.enabled !== 'boolean') {
+      return new HttpResponse('Invalid status icon settings', { status: 400 })
+    }
+
+    statusIconsEnabled = body.enabled
+    return HttpResponse.json({ enabled: statusIconsEnabled })
   }),
 
   // Get photos
@@ -277,6 +296,7 @@ export function resetMockState() {
   currentRotation = 180
   slideshowEnabled = false
   slideshowIntervalS = 3600
+  statusIconsEnabled = false
 
   photos = [
     { id: 'img_000001', landscape: 'img_000001_L_r0.bmp', portrait: 'img_000001_P_r90.bmp' },
@@ -293,6 +313,7 @@ export function getMockState() {
     currentRotation,
     slideshowEnabled,
     slideshowIntervalS,
+    statusIconsEnabled,
     currentPhotoId,
     displaying: chooseDisplaying(),
     photos: [...photos],

@@ -58,6 +58,37 @@ esp_err_t server_bsp_set_slideshow(bool enabled, uint32_t interval_s);
 // Safe to call multiple times.
 void server_bsp_init_state(void);
 
+// Network snapshot (for displaying connection info on the e-paper).
+// NOTE: Strings are null-terminated.
+typedef enum
+{
+    SERVER_BSP_WIFI_MODE_NONE = 0,
+    SERVER_BSP_WIFI_MODE_STA = 1,
+    SERVER_BSP_WIFI_MODE_AP = 2,
+} server_bsp_wifi_mode_t;
+
+typedef struct
+{
+    server_bsp_wifi_mode_t mode;
+    bool sta_connected;
+    char sta_ssid[33];
+    char sta_ip[16];
+    char ap_ssid[33];
+    char ap_password[65];
+    char hostname[32]; // e.g. frame-1a2b3c
+} server_bsp_network_info_t;
+
+// Fills a snapshot of the current Wi-Fi state.
+void server_bsp_get_network_info(server_bsp_network_info_t *out);
+
+// SoftAP default gateway IP.
+const char *server_bsp_get_ap_ip(void);
+
+// Status icon overlay (NVS-backed UI setting).
+// When enabled, the firmware can draw battery/Wi-Fi icons on top of the rendered image.
+bool server_bsp_get_status_icons_enabled(void);
+esp_err_t server_bsp_set_status_icons_enabled(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

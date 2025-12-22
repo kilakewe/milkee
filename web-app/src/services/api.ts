@@ -27,6 +27,10 @@ export interface SlideshowSettings {
   interval_s: number
 }
 
+export interface StatusIconsSettings {
+  enabled: boolean
+}
+
 export interface ReorderPhotosRequest {
   order: string[]
 }
@@ -93,6 +97,22 @@ export const api = {
       body: JSON.stringify(settings),
     })
     if (!response.ok) throw new Error('Failed to save slideshow settings')
+    return await response.json()
+  },
+
+  async getStatusIcons(): Promise<StatusIconsSettings> {
+    const response = await fetch(`${API_BASE}/api/status_icons`)
+    if (!response.ok) throw new Error('Failed to fetch status icon settings')
+    return await response.json()
+  },
+
+  async setStatusIcons(enabled: boolean): Promise<StatusIconsSettings> {
+    const response = await fetch(`${API_BASE}/api/status_icons`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    })
+    if (!response.ok) throw new Error('Failed to save status icon settings')
     return await response.json()
   },
 
