@@ -1,12 +1,23 @@
 #include "server_bsp.h"
 #include "button_bsp.h"
-#include "freertos/semphr.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 #include "esp_check.h"
+#include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+
+#include "ssid_manager.h"
+
 #include "nvs.h"
 #include "sdcard_bsp.h"
 #include "cJSON.h"
@@ -27,10 +38,57 @@ static const char *kNvsNamespace = "BrowserUpload";
 static const char *kNvsKeyRotation = "rotation";
 static const char *kNvsKeyImageRotation = "image_rotation";
 static const char *kNvsKeyCurrentImage = "current_image"; // legacy
-static const char *kNvsKeyCurrentPhotoId = "current_photo_id";
+
+// NOTE: NVS key names are limited to 15 characters (excluding terminator).
+// Keep these short or nvs_set_* will fail.
+static const char *kNvsKeyCurrentPhotoId = "cur_photo_id";
 static const char *kNvsKeyPhotoSeq = "photo_seq";
-static const char *kNvsKeySlideshowEnabled = "slideshow_enabled";
-static const char *kNvsKeySlideshowIntervalS = "slideshow_interval_s";
+static const char *kNvsKeySlideshowEnabled = "slideshow_en";
+static const char *kNvsKeySlideshowIntervalS = "slideshow_int_s";
+
+// Wi-Fi (PhotoFrame / browser upload app)
+// SoftAP defaults (used when no STA credentials, or when STA connect fails).
+static const char *kApSsidDefault = "esp_network";
+static const char *kApPassDefault = "1234567890";
+static const int kApChannelDefault = 1;
+static const int kApMaxStaConnDefault = 4;
+
+static constexpr int kStaConnectTimeoutMs = 20 * 1000;
+static constexpr int kStaMaxRetryCount = 10;
+
+// Lower peak Wi-Fi current draw by limiting TX power.
+// Units: 0.25 dBm. 56 => 14 dBm.
+static constexpr int8_t kWifiMaxTxPowerQuarterDbm = 56;
+
+enum class ServerWifiMode {
+    NONE = 0,
+    STA,
+    AP,
+};
+
+static ServerWifiMode s_wifi_mode = ServerWifiMode::NONE;
+static bool s_sta_connected = false;
+static char s_sta_ssid[33] = {0};
+static char s_sta_ip[16] = {0};
+static char s_ap_ssid[33] = {0};
+static portMUX_TYPE s_wifi_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static EventGroupHandle_t s_wifi_event_group = NULL;
+static constexpr EventBits_t WIFI_STA_CONNECTED_BIT = BIT0;
+static constexpr EventBits_t WIFI_STA_FAIL_BIT = BIT1;
+
+static int s_sta_retry_count = 0;
+
+static esp_event_handler_instance_t s_sta_wifi_instance = NULL;
+static esp_event_handler_instance_t s_sta_ip_instance = NULL;
+
+static esp_event_handler_instance_t s_ap_wifi_instance = NULL;
+static esp_event_handler_instance_t s_ap_ip_instance = NULL;
+
+static esp_netif_t *s_sta_netif = NULL;
+static esp_netif_t *s_ap_netif = NULL;
+
+static TaskHandle_t s_wifi_monitor_task = NULL;
 
 // SD card paths
 // Serve the Vue app build output (sd-content/web-app -> /sdcard/web-app)
@@ -76,6 +134,16 @@ static portMUX_TYPE s_activity_mux = portMUX_INITIALIZER_UNLOCKED;
 static void server_bsp_update_current_image_for_rotation(void);
 static void server_bsp_set_current_image_internal(const char *full_path, uint16_t img_rot);
 static esp_err_t server_bsp_recv_small_body(httpd_req_t *req, char *body, size_t body_size);
+
+// Wi-Fi helpers (PhotoFrame / browser upload app)
+static void server_bsp_start_softap(void);
+static bool server_bsp_try_connect_sta(const char *ssid, const char *password, int timeout_ms);
+static void server_bsp_stop_wifi(void);
+
+// Wi-Fi API
+static esp_err_t get_wifi_status_callback(httpd_req_t *req);
+static esp_err_t post_wifi_config_callback(httpd_req_t *req);
+static esp_err_t post_wifi_clear_callback(httpd_req_t *req);
 
 static void server_bsp_mark_activity_internal(void)
 {
@@ -1170,12 +1238,7 @@ esp_err_t server_bsp_select_next_photo(void)
 #define READ_LEN_MAX (10 * 1024) // Buffer area for receiving data
 #define SEND_LEN_MAX (5 * 1024)  // Data for sending response
 
-#define EXAMPLE_ESP_WIFI_SSID "esp_network"
-#define EXAMPLE_ESP_WIFI_PASS "1234567890"
-#define EXAMPLE_ESP_WIFI_CHANNEL 1
-#define EXAMPLE_MAX_STA_CONN 4
-
-EventGroupHandle_t server_groups;
+EventGroupHandle_t server_groups = NULL;
 
 /*Callback function*/
 esp_err_t get_static_callback(httpd_req_t *req);
@@ -1298,7 +1361,12 @@ void server_bsp_init_state(void)
 
 void http_server_init(void)
 {
-    server_groups = xEventGroupCreate();
+    // Create once. Some app modes may start tasks that wait on server_groups
+    // even when the HTTP server itself is disabled.
+    if (!server_groups)
+    {
+        server_groups = xEventGroupCreate();
+    }
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     // We register more than the HTTPD_DEFAULT_CONFIG() handler limit.
@@ -1310,6 +1378,25 @@ void http_server_init(void)
     server_bsp_mark_activity_internal();
 
     server_bsp_init_state();
+
+    // Wi-Fi API
+    httpd_uri_t uri_wifi = {};
+    uri_wifi.user_ctx = NULL;
+
+    uri_wifi.uri = "/api/wifi/status";
+    uri_wifi.method = HTTP_GET;
+    uri_wifi.handler = get_wifi_status_callback;
+    httpd_register_uri_handler(server, &uri_wifi);
+
+    uri_wifi.uri = "/api/wifi/config";
+    uri_wifi.method = HTTP_POST;
+    uri_wifi.handler = post_wifi_config_callback;
+    httpd_register_uri_handler(server, &uri_wifi);
+
+    uri_wifi.uri = "/api/wifi/clear";
+    uri_wifi.method = HTTP_POST;
+    uri_wifi.handler = post_wifi_clear_callback;
+    httpd_register_uri_handler(server, &uri_wifi);
 
     // Rotation settings API
     httpd_uri_t uri_rot = {};
@@ -1535,6 +1622,174 @@ esp_err_t get_static_callback(httpd_req_t *req)
     return server_bsp_send_sd_file(req, sd_path);
 }
 
+static void server_bsp_restart_task(void *arg)
+{
+    const uint32_t delay_ms = (uint32_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    esp_restart();
+}
+
+static void server_bsp_schedule_restart(uint32_t delay_ms)
+{
+    // Best-effort; if task creation fails, the device will just keep running.
+    (void)xTaskCreate(server_bsp_restart_task, "wifi_reboot", 2048, (void *)(uintptr_t)delay_ms, 5, NULL);
+}
+
+static const char *server_bsp_wifi_mode_to_string(ServerWifiMode mode)
+{
+    switch (mode)
+    {
+    case ServerWifiMode::STA:
+        return "sta";
+    case ServerWifiMode::AP:
+        return "ap";
+    default:
+        return "none";
+    }
+}
+
+static esp_err_t get_wifi_status_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    const auto &ssid_list = SsidManager::GetInstance().GetSsidList();
+    const bool configured = !ssid_list.empty();
+
+    char saved_ssid[33] = {0};
+    if (configured)
+    {
+        snprintf(saved_ssid, sizeof(saved_ssid), "%s", ssid_list[0].ssid.c_str());
+    }
+
+    ServerWifiMode mode = ServerWifiMode::NONE;
+    bool sta_connected = false;
+    char sta_ssid[33] = {0};
+    char sta_ip[16] = {0};
+    char ap_ssid[33] = {0};
+
+    portENTER_CRITICAL(&s_wifi_mux);
+    mode = s_wifi_mode;
+    sta_connected = s_sta_connected;
+    snprintf(sta_ssid, sizeof(sta_ssid), "%s", s_sta_ssid);
+    snprintf(sta_ip, sizeof(sta_ip), "%s", s_sta_ip);
+    snprintf(ap_ssid, sizeof(ap_ssid), "%s", s_ap_ssid);
+    portEXIT_CRITICAL(&s_wifi_mux);
+
+    // If we're not connected (or currently in AP mode), still surface the saved SSID
+    // so the web UI can prefill the form.
+    if (sta_ssid[0] == '\0' && saved_ssid[0] != '\0')
+    {
+        snprintf(sta_ssid, sizeof(sta_ssid), "%s", saved_ssid);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+
+    cJSON_AddBoolToObject(root, "configured", configured);
+    cJSON_AddStringToObject(root, "mode", server_bsp_wifi_mode_to_string(mode));
+    cJSON_AddBoolToObject(root, "connected", (mode == ServerWifiMode::STA) && sta_connected);
+    cJSON_AddStringToObject(root, "ssid", sta_ssid);
+    cJSON_AddStringToObject(root, "ip", sta_ip);
+
+    // Always report the AP defaults so the UI can tell users how to connect when in AP mode.
+    cJSON_AddStringToObject(root, "ap_ssid", ap_ssid[0] ? ap_ssid : kApSsidDefault);
+    cJSON_AddStringToObject(root, "ap_ip", "192.168.4.1");
+
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!text)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Encode error");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, text, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(text);
+    return ESP_OK;
+}
+
+static esp_err_t post_wifi_config_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    char body[256] = {0};
+    const esp_err_t body_err = server_bsp_recv_small_body(req, body, sizeof(body));
+    if (body_err == ESP_ERR_INVALID_SIZE)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_OK;
+    }
+    if (body_err != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+
+    const cJSON *jssid = cJSON_GetObjectItem(root, "ssid");
+    const cJSON *jpass = cJSON_GetObjectItem(root, "password");
+
+    const char *ssid = (jssid && cJSON_IsString(jssid) && jssid->valuestring) ? jssid->valuestring : "";
+    const char *password = (jpass && cJSON_IsString(jpass) && jpass->valuestring) ? jpass->valuestring : "";
+
+    if (ssid[0] == '\0')
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing ssid");
+        return ESP_OK;
+    }
+    if (strlen(ssid) > 32)
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID too long (max 32 bytes)");
+        return ESP_OK;
+    }
+    if (strlen(password) > 64)
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password too long (max 64 bytes)");
+        return ESP_OK;
+    }
+
+    SsidManager::GetInstance().AddSsid(ssid, password);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, "{\"ok\":true,\"rebooting\":true}\n", HTTPD_RESP_USE_STRLEN);
+
+    // Give the HTTP response a moment to flush before rebooting.
+    server_bsp_schedule_restart(500);
+    return ESP_OK;
+}
+
+static esp_err_t post_wifi_clear_callback(httpd_req_t *req)
+{
+    server_bsp_mark_activity_internal();
+
+    SsidManager::GetInstance().Clear();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, "{\"ok\":true,\"rebooting\":true}\n", HTTPD_RESP_USE_STRLEN);
+
+    server_bsp_schedule_restart(500);
+    return ESP_OK;
+}
+
 esp_err_t get_rotation_callback(httpd_req_t *req)
 {
     server_bsp_mark_activity_internal();
@@ -1595,15 +1850,17 @@ esp_err_t post_rotation_callback(httpd_req_t *req)
         return ESP_OK;
     }
 
-    // Re-display the last uploaded image (if any) using the new rotation.
-    xEventGroupSetBits(server_groups, set_bit_button(2));
-
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
     char resp[64] = {0};
     snprintf(resp, sizeof(resp), "{\"rotation\":%u}\n", (unsigned)server_bsp_get_rotation());
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+    // Re-display the last uploaded image (if any) using the new rotation.
+    // Trigger this after the response to avoid overlapping Wi-Fi TX with e-paper refresh.
+    xEventGroupSetBits(server_groups, set_bit_button(2));
+
     return ESP_OK;
 }
 
@@ -1685,7 +1942,15 @@ esp_err_t post_slideshow_callback(httpd_req_t *req)
     esp_err_t err = server_bsp_set_slideshow(enabled, interval_s);
     if (err != ESP_OK)
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid slideshow settings");
+        if (err == ESP_ERR_INVALID_ARG)
+        {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid slideshow interval");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Failed to save slideshow settings: %s", esp_err_to_name(err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save slideshow settings");
+        }
         return ESP_OK;
     }
 
@@ -1977,15 +2242,16 @@ esp_err_t post_photos_select_callback(httpd_req_t *req)
 
     server_bsp_set_current_photo_id_internal(id);
 
-    // Re-display selected image.
-    xEventGroupSetBits(server_groups, set_bit_button(2));
-
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
     char resp[256] = {0};
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"current\":\"%s\"}\n", id);
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+    // Re-display selected image after responding.
+    xEventGroupSetBits(server_groups, set_bit_button(2));
+
     return ESP_OK;
 }
 
@@ -2000,9 +2266,6 @@ esp_err_t post_photos_next_callback(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No photos");
         return ESP_OK;
     }
-
-    // Re-display newly selected image.
-    xEventGroupSetBits(server_groups, set_bit_button(2));
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -2021,6 +2284,10 @@ esp_err_t post_photos_next_callback(httpd_req_t *req)
     char resp[256] = {0};
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"current\":\"%s\"}\n", cur_id);
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+    // Re-display newly selected image after responding.
+    xEventGroupSetBits(server_groups, set_bit_button(2));
+
     return ESP_OK;
 }
 
@@ -2118,12 +2385,13 @@ esp_err_t post_photos_delete_callback(httpd_req_t *req)
         (void)remove(full);
     }
 
+    bool should_redraw = false;
     if (deleting_current)
     {
         // Pick a new current photo (or fallback).
         server_bsp_set_current_photo_id_internal("");
         (void)server_bsp_select_next_photo();
-        xEventGroupSetBits(server_groups, set_bit_button(2));
+        should_redraw = true;
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -2132,6 +2400,13 @@ esp_err_t post_photos_delete_callback(httpd_req_t *req)
     char resp[128] = {0};
     snprintf(resp, sizeof(resp), "{\"ok\":true}\n");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+    if (should_redraw)
+    {
+        // Trigger redraw after the response.
+        xEventGroupSetBits(server_groups, set_bit_button(2));
+    }
+
     return ESP_OK;
 }
 
@@ -2299,7 +2574,10 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
     server_bsp_mark_activity_internal();
     server_bsp_init_state();
 
+    // Back-compat: existing clients use ?variant=landscape|portrait[&id=...]
+    // New clients may use ?orientation=landscape|portrait|square.
     char variant[16] = {0};
+    char orientation[16] = {0};
     char id[64] = {0};
     bool has_id = false;
 
@@ -2312,6 +2590,14 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
             if (httpd_req_get_url_query_str(req, qstr, qlen) == ESP_OK)
             {
                 (void)httpd_query_key_value(qstr, "variant", variant, sizeof(variant));
+                (void)httpd_query_key_value(qstr, "orientation", orientation, sizeof(orientation));
+
+                // orientation overrides variant when provided.
+                if (orientation[0] != '\0')
+                {
+                    snprintf(variant, sizeof(variant), "%s", orientation);
+                }
+
                 if (httpd_query_key_value(qstr, "id", id, sizeof(id)) == ESP_OK)
                 {
                     has_id = true;
@@ -2323,9 +2609,10 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
 
     const bool is_landscape = (strcmp(variant, "landscape") == 0);
     const bool is_portrait = (strcmp(variant, "portrait") == 0);
-    if (!is_landscape && !is_portrait)
+    const bool is_square = (strcmp(variant, "square") == 0);
+    if (!is_landscape && !is_portrait && !is_square)
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/invalid variant (landscape|portrait)");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/invalid orientation (landscape|portrait|square)");
         return ESP_OK;
     }
 
@@ -2354,9 +2641,14 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
     {
         snprintf(filename, sizeof(filename), "%s_L_r0.bmp", id);
     }
-    else
+    else if (is_portrait)
     {
         snprintf(filename, sizeof(filename), "%s_P_r90.bmp", id);
+    }
+    else
+    {
+        // Square is stored as a single variant (treated like landscape in the library schema).
+        snprintf(filename, sizeof(filename), "%s_S_r0.bmp", id);
     }
 
     if (!server_bsp_photo_name_is_safe(filename))
@@ -2445,13 +2737,14 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (is_landscape)
+    if (is_portrait)
     {
-        p->landscape = filename;
+        p->portrait = filename;
     }
     else
     {
-        p->portrait = filename;
+        // landscape or square
+        p->landscape = filename;
     }
 
     if (is_new)
@@ -2463,18 +2756,23 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
     xSemaphoreGive(s_library_mutex);
 
     // Decide whether to switch the display to this photo now.
-    // If the upload client sends landscape+portrait in two requests, we only switch
-    // immediately when the uploaded variant matches the frame's current orientation.
+    // - Legacy clients send landscape+portrait in two requests and expect the device
+    //   to wait for the preferred orientation before switching.
+    // - New clients send a single final image (via ?orientation=...), which should
+    //   become current immediately regardless of frame orientation.
     const bool want_portrait = (server_bsp_get_rotation() == 90 || server_bsp_get_rotation() == 270);
-    const bool uploaded_matches_orientation = (want_portrait && is_portrait) || (!want_portrait && is_landscape);
+    const bool uploaded_matches_orientation = is_square || (want_portrait && is_portrait) || (!want_portrait && is_landscape);
+    const bool is_single_upload = (orientation[0] != '\0') || is_square;
 
     bool should_redraw = false;
 
     if (is_new)
     {
-        if (uploaded_matches_orientation)
+        if (is_single_upload || uploaded_matches_orientation)
         {
-            // Preferred variant arrived first; show it right away.
+            // Single-image uploads always become current immediately.
+            // For legacy two-step uploads, only switch immediately if the preferred
+            // variant arrived first.
             server_bsp_set_current_photo_id_internal(id);
             should_redraw = true;
         }
@@ -2511,11 +2809,6 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
         }
     }
 
-    if (should_redraw)
-    {
-        xEventGroupSetBits(server_groups, set_bit_button(2));
-    }
-
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
@@ -2523,6 +2816,13 @@ esp_err_t post_photos_upload_callback(httpd_req_t *req)
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":\"%s\",\"variant\":\"%s\",\"filename\":\"%s\"}\n",
              id, variant, filename);
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+
+    if (should_redraw)
+    {
+        // Trigger redraw after the response to avoid overlapping Wi-Fi TX with e-paper refresh.
+        xEventGroupSetBits(server_groups, set_bit_button(2));
+    }
+
     return ESP_OK;
 }
 
@@ -2579,13 +2879,14 @@ esp_err_t post_dataup_callback(httpd_req_t *req)
         server_bsp_mark_activity_internal();
     }
     xEventGroupSetBits(server_groups, set_bit_button(1));
+    bool should_redraw = false;
     if (sdcard_len == req->content_len)
     {
         // Current image becomes the newly uploaded photo.
         server_bsp_set_current_image_internal(photo_path, rot);
 
         httpd_resp_send_chunk(req, "上传成功", strlen("上传成功"));
-        xEventGroupSetBits(server_groups, set_bit_button(2));
+        should_redraw = true;
     }
     else
     {
@@ -2594,23 +2895,40 @@ esp_err_t post_dataup_callback(httpd_req_t *req)
     }
     httpd_resp_send_chunk(req, NULL, 0);
 
+    if (should_redraw)
+    {
+        // Trigger redraw after the HTTP response completes.
+        xEventGroupSetBits(server_groups, set_bit_button(2));
+    }
+
     heap_caps_free(buf);
     buf = NULL;
     return ESP_OK;
 }
 
-/*wifi ap init*/
+// Wi-Fi init (STA + AP fallback)
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-    if (event_id == WIFI_EVENT_AP_STACONNECTED)
+    (void)arg;
+    (void)event_data;
+
+    // AP-only events.
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
     {
         server_bsp_mark_activity_internal();
-        xEventGroupSetBits(server_groups, set_bit_button(4));
+        if (server_groups)
+        {
+            xEventGroupSetBits(server_groups, set_bit_button(4));
+        }
     }
-    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
         server_bsp_mark_activity_internal();
-        xEventGroupSetBits(server_groups, set_bit_button(5));
+        if (server_groups)
+        {
+            xEventGroupSetBits(server_groups, set_bit_button(5));
+        }
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED)
     {
@@ -2618,41 +2936,435 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-void Network_wifi_ap_init(void)
+static void wifi_sta_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    assert(esp_netif_create_default_wifi_ap());
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    (void)arg;
+    (void)event_data;
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_AP_STAIPASSIGNED,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    if (event_base != WIFI_EVENT)
+    {
+        return;
+    }
+
+    if (event_id == WIFI_EVENT_STA_START)
+    {
+        s_sta_retry_count = 0;
+        (void)esp_wifi_connect();
+    }
+    else if (event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        portENTER_CRITICAL(&s_wifi_mux);
+        s_sta_connected = false;
+        s_sta_ip[0] = '\0';
+        portEXIT_CRITICAL(&s_wifi_mux);
+
+        if (s_sta_retry_count < kStaMaxRetryCount)
+        {
+            s_sta_retry_count++;
+            (void)esp_wifi_connect();
+            ESP_LOGW("network", "STA disconnected, retry %d/%d", s_sta_retry_count, kStaMaxRetryCount);
+        }
+        else
+        {
+            if (s_wifi_event_group)
+            {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_STA_FAIL_BIT);
+            }
+        }
+    }
+}
+
+static void wifi_sta_got_ip_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+
+    if (event_base != IP_EVENT || event_id != IP_EVENT_STA_GOT_IP || event_data == nullptr)
+    {
+        return;
+    }
+
+    auto *event = static_cast<ip_event_got_ip_t *>(event_data);
+
+    char ip[16] = {0};
+    esp_ip4addr_ntoa(&event->ip_info.ip, ip, sizeof(ip));
+
+    portENTER_CRITICAL(&s_wifi_mux);
+    s_wifi_mode = ServerWifiMode::STA;
+    s_sta_connected = true;
+    snprintf(s_sta_ip, sizeof(s_sta_ip), "%s", ip);
+    portEXIT_CRITICAL(&s_wifi_mux);
+
+    server_bsp_mark_activity_internal();
+
+    if (s_wifi_event_group)
+    {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_STA_CONNECTED_BIT);
+    }
+
+    ESP_LOGI("network", "STA got IP: %s", ip);
+}
+
+static void server_bsp_wifi_monitor_task(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        if (!s_wifi_event_group)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        const EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                                     WIFI_STA_FAIL_BIT,
+                                                     pdTRUE,
+                                                     pdFALSE,
+                                                     portMAX_DELAY);
+
+        if (bits & WIFI_STA_FAIL_BIT)
+        {
+            ESP_LOGW("network", "STA reconnect failed; switching to SoftAP");
+
+            // Prevent server_bsp_stop_wifi() from trying to delete this task by handle.
+            s_wifi_monitor_task = NULL;
+
+            server_bsp_stop_wifi();
+            server_bsp_start_softap();
+
+            vTaskDelete(NULL);
+        }
+    }
+}
+
+static void server_bsp_stop_wifi(void)
+{
+    // Best-effort cleanup; this runs in a device-app context so don't abort.
+
+    if (s_wifi_monitor_task)
+    {
+        vTaskDelete(s_wifi_monitor_task);
+        s_wifi_monitor_task = NULL;
+    }
+
+    if (s_sta_wifi_instance)
+    {
+        (void)esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_sta_wifi_instance);
+        s_sta_wifi_instance = NULL;
+    }
+    if (s_sta_ip_instance)
+    {
+        (void)esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_sta_ip_instance);
+        s_sta_ip_instance = NULL;
+    }
+    if (s_ap_wifi_instance)
+    {
+        (void)esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_ap_wifi_instance);
+        s_ap_wifi_instance = NULL;
+    }
+    if (s_ap_ip_instance)
+    {
+        (void)esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, s_ap_ip_instance);
+        s_ap_ip_instance = NULL;
+    }
+
+    (void)esp_wifi_stop();
+    (void)esp_wifi_deinit();
+
+    if (s_wifi_event_group)
+    {
+        vEventGroupDelete(s_wifi_event_group);
+        s_wifi_event_group = NULL;
+    }
+
+    s_sta_retry_count = 0;
+
+    portENTER_CRITICAL(&s_wifi_mux);
+    s_wifi_mode = ServerWifiMode::NONE;
+    s_sta_connected = false;
+    s_sta_ssid[0] = '\0';
+    s_sta_ip[0] = '\0';
+    s_ap_ssid[0] = '\0';
+    portEXIT_CRITICAL(&s_wifi_mux);
+}
+
+static void server_bsp_start_softap(void)
+{
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGE("network", "esp_netif_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (!s_ap_netif)
+    {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
+    if (!s_ap_netif)
+    {
+        ESP_LOGE("network", "esp_netif_create_default_wifi_ap failed (NULL)");
+        return;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE)
+    {
+        ESP_LOGE("network", "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Register AP event handlers once.
+    if (!s_ap_wifi_instance)
+    {
+        err = esp_event_handler_instance_register(WIFI_EVENT,
+                                                  ESP_EVENT_ANY_ID,
+                                                  &wifi_event_handler,
+                                                  NULL,
+                                                  &s_ap_wifi_instance);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW("network", "wifi ap event handler register failed: %s", esp_err_to_name(err));
+        }
+    }
+    if (!s_ap_ip_instance)
+    {
+        err = esp_event_handler_instance_register(IP_EVENT,
+                                                  IP_EVENT_AP_STAIPASSIGNED,
+                                                  &wifi_event_handler,
+                                                  NULL,
+                                                  &s_ap_ip_instance);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW("network", "ip ap event handler register failed: %s", esp_err_to_name(err));
+        }
+    }
 
     wifi_config_t wifi_config = {};
-    snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", EXAMPLE_ESP_WIFI_SSID);
-    snprintf((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), "%s", EXAMPLE_ESP_WIFI_PASS);
-    wifi_config.ap.channel = EXAMPLE_ESP_WIFI_CHANNEL;
-    wifi_config.ap.max_connection = EXAMPLE_MAX_STA_CONN;
-    wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", kApSsidDefault);
+    snprintf((char *)wifi_config.ap.password, sizeof(wifi_config.ap.password), "%s", kApPassDefault);
+    wifi_config.ap.channel = kApChannelDefault;
+    wifi_config.ap.max_connection = kApMaxStaConnDefault;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI("network", "wifi_init_softap finished. SSID:%s password:%s channel:%d",
-             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+    if (strlen(kApPassDefault) == 0)
+    {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+    else
+    {
+        wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("network", "esp_wifi_set_mode(AP) failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("network", "esp_wifi_set_config(AP) failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("network", "esp_wifi_start(AP) failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Reduce peak draw on marginal supplies.
+    err = esp_wifi_set_max_tx_power(kWifiMaxTxPowerQuarterDbm);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW("network", "esp_wifi_set_max_tx_power(%d) failed: %s", (int)kWifiMaxTxPowerQuarterDbm, esp_err_to_name(err));
+    }
+
+    portENTER_CRITICAL(&s_wifi_mux);
+    s_wifi_mode = ServerWifiMode::AP;
+    s_sta_connected = false;
+    s_sta_ip[0] = '\0';
+    snprintf(s_ap_ssid, sizeof(s_ap_ssid), "%s", kApSsidDefault);
+    portEXIT_CRITICAL(&s_wifi_mux);
+
+    ESP_LOGI("network", "SoftAP started. SSID:%s password:%s channel:%d", kApSsidDefault, kApPassDefault, kApChannelDefault);
+}
+
+static bool server_bsp_try_connect_sta(const char *ssid, const char *password, int timeout_ms)
+{
+    if (!ssid || ssid[0] == '\0')
+    {
+        return false;
+    }
+
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGE("network", "esp_netif_init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (!s_wifi_event_group)
+    {
+        s_wifi_event_group = xEventGroupCreate();
+    }
+    if (!s_wifi_event_group)
+    {
+        ESP_LOGE("network", "Failed to create Wi-Fi event group");
+        return false;
+    }
+
+    xEventGroupClearBits(s_wifi_event_group, WIFI_STA_CONNECTED_BIT | WIFI_STA_FAIL_BIT);
+
+    if (!s_sta_netif)
+    {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+    }
+    if (!s_sta_netif)
+    {
+        ESP_LOGE("network", "esp_netif_create_default_wifi_sta failed (NULL)");
+        return false;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE)
+    {
+        ESP_LOGE("network", "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // Register STA handlers once.
+    if (!s_sta_wifi_instance)
+    {
+        err = esp_event_handler_instance_register(WIFI_EVENT,
+                                                  ESP_EVENT_ANY_ID,
+                                                  &wifi_sta_event_handler,
+                                                  NULL,
+                                                  &s_sta_wifi_instance);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGE("network", "wifi sta event handler register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    if (!s_sta_ip_instance)
+    {
+        err = esp_event_handler_instance_register(IP_EVENT,
+                                                  IP_EVENT_STA_GOT_IP,
+                                                  &wifi_sta_got_ip_handler,
+                                                  NULL,
+                                                  &s_sta_ip_instance);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGE("network", "ip sta event handler register failed: %s", esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    wifi_config_t wifi_config = {};
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", password ? password : "");
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("network", "esp_wifi_set_mode(STA) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("network", "esp_wifi_set_config(STA) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_wifi_mux);
+    s_wifi_mode = ServerWifiMode::STA;
+    s_sta_connected = false;
+    snprintf(s_sta_ssid, sizeof(s_sta_ssid), "%s", ssid);
+    s_sta_ip[0] = '\0';
+    portEXIT_CRITICAL(&s_wifi_mux);
+
+    err = esp_wifi_start();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("network", "esp_wifi_start(STA) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // Reduce peak draw on marginal supplies.
+    err = esp_wifi_set_max_tx_power(kWifiMaxTxPowerQuarterDbm);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW("network", "esp_wifi_set_max_tx_power(%d) failed: %s", (int)kWifiMaxTxPowerQuarterDbm, esp_err_to_name(err));
+    }
+    // STA power-save can reduce average/peak current once associated.
+    (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+    // In case WIFI_EVENT_STA_START already fired before we registered, try connect explicitly.
+    (void)esp_wifi_connect();
+
+    ESP_LOGI("network", "Connecting to Wi-Fi SSID:%s", ssid);
+
+    const EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                                 WIFI_STA_CONNECTED_BIT | WIFI_STA_FAIL_BIT,
+                                                 pdTRUE,
+                                                 pdFALSE,
+                                                 pdMS_TO_TICKS(timeout_ms));
+
+    if (bits & WIFI_STA_CONNECTED_BIT)
+    {
+        if (!s_wifi_monitor_task)
+        {
+            (void)xTaskCreate(server_bsp_wifi_monitor_task, "wifi_monitor", 2048, NULL, 4, &s_wifi_monitor_task);
+        }
+        return true;
+    }
+
+    ESP_LOGW("network", "STA connect failed/timeout; falling back to SoftAP");
+    server_bsp_stop_wifi();
+    return false;
+}
+
+void Network_wifi_init(void)
+{
+    // If no SSID is configured, start SoftAP.
+    auto &ssid_manager = SsidManager::GetInstance();
+    const auto &ssid_list = ssid_manager.GetSsidList();
+
+    if (ssid_list.empty())
+    {
+        ESP_LOGI("network", "No Wi-Fi configured; starting SoftAP");
+        server_bsp_start_softap();
+        return;
+    }
+
+    // Try the first configured network.
+    const auto &item = ssid_list[0];
+    if (server_bsp_try_connect_sta(item.ssid.c_str(), item.password.c_str(), kStaConnectTimeoutMs))
+    {
+        ESP_LOGI("network", "Connected to Wi-Fi SSID:%s", item.ssid.c_str());
+        return;
+    }
+
+    server_bsp_start_softap();
+}
+
+void Network_wifi_ap_init(void)
+{
+    // Legacy entrypoint.
+    Network_wifi_init();
 }
 
 void set_espWifi_sleep(void)
 {
-    esp_wifi_stop();
-    esp_wifi_deinit();
+    server_bsp_stop_wifi();
     vTaskDelay(pdMS_TO_TICKS(500));
 }

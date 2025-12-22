@@ -13,7 +13,16 @@ extern "C" {
 #endif
 
 void http_server_init(void);
+
+// Network initialization for the PhotoPainter browser upload app.
+// Behavior:
+// - If Wi-Fi credentials are configured and STA connects, run in STA mode.
+// - Otherwise, start a SoftAP so the web app is still reachable.
+void Network_wifi_init(void);
+
+// Backward-compatible name (legacy callers).
 void Network_wifi_ap_init(void);
+
 void set_espWifi_sleep(void);
 
 // Rotation setting for the browser upload app.

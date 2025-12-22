@@ -730,6 +730,386 @@ UBYTE GUI_ReadBmp_RGB_6Color_Rotate(const char *path, UWORD Xstart, UWORD Ystart
     heap_caps_free(Image);
     return 0;
 }
+
+bool GUI_Bmp_GetDimensions(const char *path, int *out_width, int *out_height)
+{
+    if (out_width)
+        *out_width = 0;
+    if (out_height)
+        *out_height = 0;
+
+    if (!path || !out_width || !out_height)
+    {
+        return false;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp)
+    {
+        ESP_LOGE(TAG, "Can't open file: %s", path);
+        return false;
+    }
+
+    BMPFILEHEADER bmpFileHeader;
+    BMPINFOHEADER bmpInfoHeader;
+
+    if (fread(&bmpFileHeader, sizeof(BMPFILEHEADER), 1, fp) != 1 ||
+        fread(&bmpInfoHeader, sizeof(BMPINFOHEADER), 1, fp) != 1)
+    {
+        ESP_LOGE(TAG, "Failed to read BMP header");
+        fclose(fp);
+        return false;
+    }
+
+    fclose(fp);
+
+    if (bmpFileHeader.bType != 0x4D42)
+    {
+        // Not a BMP.
+        return false;
+    }
+
+    if (bmpInfoHeader.biWidth <= 0 || bmpInfoHeader.biHeight == 0)
+    {
+        return false;
+    }
+
+    // BMP height can be negative (top-down). Treat as absolute size.
+    const int w = (int)bmpInfoHeader.biWidth;
+    const int h = (bmpInfoHeader.biHeight < 0) ? (int)(-bmpInfoHeader.biHeight) : (int)bmpInfoHeader.biHeight;
+
+    *out_width = w;
+    *out_height = h;
+    return true;
+}
+
+static inline UWORD GUI_MinUword(UWORD a, UWORD b)
+{
+    return (a < b) ? a : b;
+}
+
+static inline float GUI_Clamp255f(float v)
+{
+    if (v < 0.0f)
+        return 0.0f;
+    if (v > 255.0f)
+        return 255.0f;
+    return v;
+}
+
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t paint;
+} GUI_PaletteEntry;
+
+static const GUI_PaletteEntry GUI_PALETTE_6[6] = {
+    {0, 0, 0, 0},         // black
+    {255, 255, 255, 1},   // white
+    {255, 255, 0, 2},     // yellow
+    {255, 0, 0, 3},       // red
+    {0, 0, 255, 5},       // blue (note: paint index 5)
+    {0, 255, 0, 6},       // green
+};
+
+static inline uint8_t GUI_ClosestPaletteColor6(float r, float g, float b)
+{
+    int best = 0;
+    int bestD = 0x7FFFFFFF;
+    for (int i = 0; i < 6; i++)
+    {
+        const int dr = (int)r - (int)GUI_PALETTE_6[i].r;
+        const int dg = (int)g - (int)GUI_PALETTE_6[i].g;
+        const int db = (int)b - (int)GUI_PALETTE_6[i].b;
+        const int d = dr * dr + dg * dg + db * db;
+        if (d < bestD)
+        {
+            bestD = d;
+            best = i;
+        }
+    }
+    return GUI_PALETTE_6[best].paint;
+}
+
+UBYTE GUI_DrawBmp_RGB_6Color_Fit(const char *path, UWORD Xstart, UWORD Ystart, UWORD boxW, UWORD boxH, bool allow_upscale)
+{
+    FILE *fp;
+    BMPFILEHEADER bmpFileHeader;
+    BMPINFOHEADER bmpInfoHeader;
+
+    fp = fopen(path, "rb");
+    if (!fp)
+    {
+        ESP_LOGE(TAG, "Can't open file: %s", path);
+        return 0;
+    }
+
+    if (fread(&bmpFileHeader, sizeof(BMPFILEHEADER), 1, fp) != 1 ||
+        fread(&bmpInfoHeader, sizeof(BMPINFOHEADER), 1, fp) != 1)
+    {
+        ESP_LOGE(TAG, "Failed to read BMP header");
+        fclose(fp);
+        return 0;
+    }
+
+    if (bmpInfoHeader.biBitCount != 24)
+    {
+        ESP_LOGE(TAG, "Bmp image is not 24-bit!");
+        fclose(fp);
+        return 0;
+    }
+
+    const int width = (int)bmpInfoHeader.biWidth;
+    const int height_abs = (bmpInfoHeader.biHeight < 0) ? (int)(-bmpInfoHeader.biHeight) : (int)bmpInfoHeader.biHeight;
+
+    if (width <= 0 || height_abs <= 0)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    const UWORD srcW = (UWORD)width;
+    const UWORD srcH = (UWORD)height_abs;
+
+    const int rowSize = (((int)srcW * 3 + 3) & ~3);
+
+    UBYTE *rowBuf = (UBYTE *)heap_caps_malloc((size_t)rowSize, MALLOC_CAP_SPIRAM);
+    uint8_t *srcRgb = (uint8_t *)heap_caps_malloc((size_t)srcW * (size_t)srcH * 3, MALLOC_CAP_SPIRAM);
+
+    if (!rowBuf || !srcRgb)
+    {
+        ESP_LOGE(TAG, "Memory allocation failed!");
+        if (rowBuf)
+            heap_caps_free(rowBuf);
+        if (srcRgb)
+            heap_caps_free(srcRgb);
+        fclose(fp);
+        return 0;
+    }
+
+    if (fseek(fp, bmpFileHeader.bOffset, SEEK_SET) != 0)
+    {
+        ESP_LOGE(TAG, "fseek failed");
+        heap_caps_free(rowBuf);
+        heap_caps_free(srcRgb);
+        fclose(fp);
+        return 0;
+    }
+
+    // Decode BMP into a top-down RGB888 buffer.
+    for (UWORD y = 0; y < srcH; y++)
+    {
+        const size_t got = fread(rowBuf, 1, (size_t)rowSize, fp);
+        if (got != (size_t)rowSize)
+        {
+            ESP_LOGE(TAG, "BMP read error at line %u (got %zu, want %u)", (unsigned)y, got, (unsigned)rowSize);
+            break;
+        }
+
+        // BMP is bottom-up unless height is negative.
+        const UWORD dstY = (bmpInfoHeader.biHeight < 0) ? y : (UWORD)(srcH - 1 - y);
+        uint8_t *dst = srcRgb + ((size_t)dstY * (size_t)srcW * 3);
+
+        const UBYTE *p = rowBuf;
+        for (UWORD x = 0; x < srcW; x++)
+        {
+            const uint8_t b = *p++;
+            const uint8_t g = *p++;
+            const uint8_t r = *p++;
+            dst[(size_t)x * 3 + 0] = r;
+            dst[(size_t)x * 3 + 1] = g;
+            dst[(size_t)x * 3 + 2] = b;
+        }
+    }
+
+    fclose(fp);
+
+    // Compute fit-scaled output size.
+    UWORD outW = boxW;
+    UWORD outH = boxH;
+
+    if (!allow_upscale && srcW <= boxW && srcH <= boxH)
+    {
+        outW = srcW;
+        outH = srcH;
+    }
+    else
+    {
+        const uint64_t left = (uint64_t)srcW * (uint64_t)boxH;
+        const uint64_t right = (uint64_t)srcH * (uint64_t)boxW;
+
+        if (left > right)
+        {
+            outW = boxW;
+            outH = (UWORD)((uint64_t)srcH * (uint64_t)boxW / (uint64_t)srcW);
+        }
+        else
+        {
+            outH = boxH;
+            outW = (UWORD)((uint64_t)srcW * (uint64_t)boxH / (uint64_t)srcH);
+        }
+
+        if (outW == 0)
+            outW = 1;
+        if (outH == 0)
+            outH = 1;
+
+        outW = GUI_MinUword(outW, boxW);
+        outH = GUI_MinUword(outH, boxH);
+    }
+
+    const int dx0 = (int)Xstart + (int)(boxW - outW) / 2;
+    const int dy0 = (int)Ystart + (int)(boxH - outH) / 2;
+
+    // Floyd–Steinberg dithering in destination space.
+    float *errR = (float *)malloc(sizeof(float) * ((size_t)outW + 2));
+    float *errG = (float *)malloc(sizeof(float) * ((size_t)outW + 2));
+    float *errB = (float *)malloc(sizeof(float) * ((size_t)outW + 2));
+
+    float *nextErrR = (float *)malloc(sizeof(float) * ((size_t)outW + 2));
+    float *nextErrG = (float *)malloc(sizeof(float) * ((size_t)outW + 2));
+    float *nextErrB = (float *)malloc(sizeof(float) * ((size_t)outW + 2));
+
+    if (!errR || !errG || !errB || !nextErrR || !nextErrG || !nextErrB)
+    {
+        if (errR)
+            free(errR);
+        if (errG)
+            free(errG);
+        if (errB)
+            free(errB);
+        if (nextErrR)
+            free(nextErrR);
+        if (nextErrG)
+            free(nextErrG);
+        if (nextErrB)
+            free(nextErrB);
+
+        heap_caps_free(rowBuf);
+        heap_caps_free(srcRgb);
+        return 0;
+    }
+
+    memset(errR, 0, sizeof(float) * ((size_t)outW + 2));
+    memset(errG, 0, sizeof(float) * ((size_t)outW + 2));
+    memset(errB, 0, sizeof(float) * ((size_t)outW + 2));
+    memset(nextErrR, 0, sizeof(float) * ((size_t)outW + 2));
+    memset(nextErrG, 0, sizeof(float) * ((size_t)outW + 2));
+    memset(nextErrB, 0, sizeof(float) * ((size_t)outW + 2));
+
+    for (UWORD y = 0; y < outH; y++)
+    {
+        if ((y % 16) == 0 && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        const UWORD py = (UWORD)(dy0 + (int)y);
+        if (py >= Paint.Height)
+            break;
+
+        const UWORD sy = (UWORD)((uint64_t)y * (uint64_t)srcH / (uint64_t)outH);
+        const uint8_t *srcRow = srcRgb + ((size_t)sy * (size_t)srcW * 3);
+
+        for (UWORD x = 0; x < outW; x++)
+        {
+            const UWORD px = (UWORD)(dx0 + (int)x);
+            if (px >= Paint.Width)
+                break;
+
+            const UWORD sx = (UWORD)((uint64_t)x * (uint64_t)srcW / (uint64_t)outW);
+            const uint8_t *sp = srcRow + ((size_t)sx * 3);
+
+            float r = (float)sp[0] + errR[x];
+            float g = (float)sp[1] + errG[x];
+            float b = (float)sp[2] + errB[x];
+
+            r = GUI_Clamp255f(r);
+            g = GUI_Clamp255f(g);
+            b = GUI_Clamp255f(b);
+
+            // Quantize
+            const uint8_t paint = GUI_ClosestPaletteColor6(r, g, b);
+            Paint_SetPixel(px, py, paint);
+
+            // Find the palette RGB we used (for error calc).
+            uint8_t pr = 255, pg = 255, pb = 255;
+            for (int i = 0; i < 6; i++)
+            {
+                if (GUI_PALETTE_6[i].paint == paint)
+                {
+                    pr = GUI_PALETTE_6[i].r;
+                    pg = GUI_PALETTE_6[i].g;
+                    pb = GUI_PALETTE_6[i].b;
+                    break;
+                }
+            }
+
+            const float er = r - (float)pr;
+            const float eg = g - (float)pg;
+            const float eb = b - (float)pb;
+
+            // Right pixel (7/16)
+            if (x + 1 < outW)
+            {
+                errR[x + 1] += er * (7.0f / 16.0f);
+                errG[x + 1] += eg * (7.0f / 16.0f);
+                errB[x + 1] += eb * (7.0f / 16.0f);
+            }
+
+            // Next row
+            if (y + 1 < outH)
+            {
+                if (x > 0)
+                {
+                    nextErrR[x - 1] += er * (3.0f / 16.0f);
+                    nextErrG[x - 1] += eg * (3.0f / 16.0f);
+                    nextErrB[x - 1] += eb * (3.0f / 16.0f);
+                }
+
+                nextErrR[x] += er * (5.0f / 16.0f);
+                nextErrG[x] += eg * (5.0f / 16.0f);
+                nextErrB[x] += eb * (5.0f / 16.0f);
+
+                if (x + 1 < outW)
+                {
+                    nextErrR[x + 1] += er * (1.0f / 16.0f);
+                    nextErrG[x + 1] += eg * (1.0f / 16.0f);
+                    nextErrB[x + 1] += eb * (1.0f / 16.0f);
+                }
+            }
+        }
+
+        // Swap row buffers.
+        float *tmp;
+        tmp = errR;
+        errR = nextErrR;
+        nextErrR = tmp;
+        memset(nextErrR, 0, sizeof(float) * ((size_t)outW + 2));
+
+        tmp = errG;
+        errG = nextErrG;
+        nextErrG = tmp;
+        memset(nextErrG, 0, sizeof(float) * ((size_t)outW + 2));
+
+        tmp = errB;
+        errB = nextErrB;
+        nextErrB = tmp;
+        memset(nextErrB, 0, sizeof(float) * ((size_t)outW + 2));
+    }
+
+    free(errR);
+    free(errG);
+    free(errB);
+    free(nextErrR);
+    free(nextErrG);
+    free(nextErrB);
+
+    heap_caps_free(rowBuf);
+    heap_caps_free(srcRgb);
+    return 0;
+}
 #else
 
 UBYTE GUI_ReadBmp_RGB_6Color(const char *path, UWORD Xstart, UWORD Ystart)

@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { api, type UploadVariant } from '@/services/api'
+import { api, type UploadOrientation } from '@/services/api'
 import {
   loadImage,
   calculateCenterCrop,
   cropAndResize,
   fitAndResize,
-  ditherImage,
   imageToBMP,
+  rotateImageElement,
+  getOrientationFromDimensions,
+  getTargetDimensionsForOrientation,
   type CropParams,
+  type ImageOrientation,
 } from '@/utils/imageProcessing'
 import ImageCropper from './ImageCropper.vue'
 
@@ -21,53 +24,101 @@ const emit = defineEmits<{
   complete: []
 }>()
 
+type Mode = 'crop' | 'scale'
+
 const file = ref<File | null>(null)
-const loadedImage = ref<HTMLImageElement | null>(null)
+const baseImage = ref<HTMLImageElement | null>(null)
+const workingImage = ref<HTMLImageElement | null>(null)
+
 const cropParams = ref<CropParams | null>(null)
+
 const previewUrl = ref<string | null>(null)
-
-const primaryVariant = ref<UploadVariant>(
-  props.rotation === 0 || props.rotation === 180 ? 'landscape' : 'portrait',
-)
-const alternateVariant = computed<UploadVariant>(() =>
-  primaryVariant.value === 'landscape' ? 'portrait' : 'landscape',
-)
-
-const primaryDims = computed(() =>
-  primaryVariant.value === 'landscape' ? { width: 800, height: 480 } : { width: 480, height: 800 },
-)
-const alternateDims = computed(() =>
-  alternateVariant.value === 'landscape' ? { width: 800, height: 480 } : { width: 480, height: 800 },
-)
-
-const primaryPreviewUrl = ref<string | null>(null)
-const alternatePreviewUrl = ref<string | null>(null)
-const primaryBmp = ref<Blob | null>(null)
-const alternateBmp = ref<Blob | null>(null)
+const processedPreviewUrl = ref<string | null>(null)
+const processedBmp = ref<Blob | null>(null)
 
 const showCropper = ref(false)
 const processing = ref(false)
 const uploading = ref(false)
 const error = ref<string | null>(null)
 
+const rotateDeg = ref<0 | 90 | 180 | 270>(0)
+const mode = ref<Mode>('crop')
+
+const defaultTargetOrientation = computed<UploadOrientation>(() =>
+  props.rotation === 0 || props.rotation === 180 ? 'landscape' : 'portrait',
+)
+
+const targetOrientation = ref<'auto' | UploadOrientation>(defaultTargetOrientation.value)
+
+const detectedOrientation = computed<ImageOrientation | null>(() => {
+  if (!workingImage.value) return null
+  return getOrientationFromDimensions(workingImage.value.width, workingImage.value.height)
+})
+
+const effectiveOrientation = computed<UploadOrientation>(() => {
+  if (targetOrientation.value !== 'auto') return targetOrientation.value
+
+  const detected = detectedOrientation.value
+  if (detected) return detected
+
+  return defaultTargetOrientation.value
+})
+
+const targetDims = computed(() => getTargetDimensionsForOrientation(effectiveOrientation.value))
+
 function resetProcessed() {
-  primaryPreviewUrl.value = null
-  alternatePreviewUrl.value = null
-  primaryBmp.value = null
-  alternateBmp.value = null
+  processedPreviewUrl.value = null
+  processedBmp.value = null
 }
 
-watch(primaryVariant, () => {
-  if (!loadedImage.value) return
+function revokePreviewUrl() {
+  if (previewUrl.value) {
+    URL.revokeObjectURL(previewUrl.value)
+    previewUrl.value = null
+  }
+}
 
-  cropParams.value = calculateCenterCrop(
-    loadedImage.value.width,
-    loadedImage.value.height,
-    primaryDims.value.width,
-    primaryDims.value.height,
-  )
+watch(
+  () => [workingImage.value, effectiveOrientation.value] as const,
+  () => {
+    if (!workingImage.value) return
 
+    cropParams.value = calculateCenterCrop(
+      workingImage.value.width,
+      workingImage.value.height,
+      targetDims.value.width,
+      targetDims.value.height,
+    )
+
+    resetProcessed()
+  },
+)
+
+watch(mode, () => {
   resetProcessed()
+})
+
+let rotateToken = 0
+watch(rotateDeg, async (deg) => {
+  if (!baseImage.value) return
+
+  const token = ++rotateToken
+
+  try {
+    processing.value = true
+    error.value = null
+    resetProcessed()
+
+    const rotated = await rotateImageElement(baseImage.value, deg)
+    if (token !== rotateToken) return
+
+    workingImage.value = rotated
+  } catch (err) {
+    if (token !== rotateToken) return
+    error.value = err instanceof Error ? err.message : 'Failed to rotate image'
+  } finally {
+    if (token === rotateToken) processing.value = false
+  }
 })
 
 async function handleFileSelect(event: Event) {
@@ -84,22 +135,28 @@ async function handleFileSelect(event: Event) {
   try {
     processing.value = true
     error.value = null
-    resetProcessed()
+
+    reset()
 
     file.value = selectedFile
-    loadedImage.value = await loadImage(selectedFile)
     previewUrl.value = URL.createObjectURL(selectedFile)
 
-    cropParams.value = calculateCenterCrop(
-      loadedImage.value.width,
-      loadedImage.value.height,
-      primaryDims.value.width,
-      primaryDims.value.height,
-    )
+    baseImage.value = await loadImage(selectedFile)
+    rotateDeg.value = 0
+    workingImage.value = baseImage.value
 
-    processing.value = false
+    // Default to matching the current frame orientation, but allow Auto.
+    targetOrientation.value = defaultTargetOrientation.value
+
+    cropParams.value = calculateCenterCrop(
+      workingImage.value.width,
+      workingImage.value.height,
+      targetDims.value.width,
+      targetDims.value.height,
+    )
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to load image'
+  } finally {
     processing.value = false
   }
 }
@@ -116,34 +173,26 @@ function imageDataToDataURL(imageData: ImageData): string {
   return canvas.toDataURL()
 }
 
-function processImages() {
-  if (!loadedImage.value || !cropParams.value) return
+function processImage() {
+  if (!workingImage.value) return
+  if (mode.value === 'crop' && !cropParams.value) return
 
   try {
     processing.value = true
     error.value = null
     resetProcessed()
 
-    // Primary variant: crop-to-fill.
-    const primaryImage = cropAndResize(
-      loadedImage.value,
-      primaryDims.value.width,
-      primaryDims.value.height,
-      cropParams.value,
-    )
-    const primaryDithered = ditherImage(primaryImage)
-    primaryPreviewUrl.value = imageDataToDataURL(primaryDithered)
-    primaryBmp.value = imageToBMP(primaryDithered)
+    const imageData =
+      mode.value === 'crop'
+        ? cropAndResize(workingImage.value, targetDims.value.width, targetDims.value.height, cropParams.value!)
+        : fitAndResize(workingImage.value, targetDims.value.width, targetDims.value.height)
 
-    // Alternate variant: fit-to-contain (letterbox with white background).
-    const altImage = fitAndResize(loadedImage.value, alternateDims.value.width, alternateDims.value.height)
-    const altDithered = ditherImage(altImage)
-    alternatePreviewUrl.value = imageDataToDataURL(altDithered)
-    alternateBmp.value = imageToBMP(altDithered)
-
-    processing.value = false
+    // NOTE: Dithering happens on-device. We upload the processed 24-bit BMP as-is.
+    processedPreviewUrl.value = imageDataToDataURL(imageData)
+    processedBmp.value = imageToBMP(imageData)
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to process image'
+  } finally {
     processing.value = false
   }
 }
@@ -151,20 +200,17 @@ function processImages() {
 function handleCropUpdate(newCrop: CropParams) {
   cropParams.value = newCrop
   showCropper.value = false
-  processImages()
+  processImage()
 }
 
-async function uploadImages() {
-  if (!primaryBmp.value || !alternateBmp.value) return
+async function uploadImage() {
+  if (!processedBmp.value) return
 
   try {
     uploading.value = true
     error.value = null
 
-    // Upload primary first (allocates an id), then upload alternate variant using that id.
-    const first = await api.uploadPhotoVariant(primaryVariant.value, primaryBmp.value)
-    await api.uploadPhotoVariant(alternateVariant.value, alternateBmp.value, first.id)
-
+    await api.uploadPhoto(effectiveOrientation.value, processedBmp.value)
     emit('complete')
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to upload image'
@@ -175,12 +221,17 @@ async function uploadImages() {
 
 function reset() {
   file.value = null
-  loadedImage.value = null
+  baseImage.value = null
+  workingImage.value = null
   cropParams.value = null
-  previewUrl.value = null
   showCropper.value = false
   error.value = null
+  rotateDeg.value = 0
+  mode.value = 'crop'
+  targetOrientation.value = defaultTargetOrientation.value
+
   resetProcessed()
+  revokePreviewUrl()
 }
 </script>
 
@@ -195,25 +246,52 @@ function reset() {
       <div class="dialog-content">
         <div class="info-box">
           <div class="info-row">
-            <strong>Primary:</strong> {{ primaryVariant }} ({{ primaryDims.width }}×{{ primaryDims.height }})
+            <strong>Detected:</strong> {{ detectedOrientation || '—' }}
           </div>
           <div class="info-row">
-            <strong>Alternate:</strong> {{ alternateVariant }} ({{ alternateDims.width }}×{{ alternateDims.height }})
+            <strong>Target:</strong> {{ effectiveOrientation }} ({{ targetDims.width }}×{{ targetDims.height }})
           </div>
-          <div class="info-hint">Primary uses crop-to-fill. Alternate uses fit-to-frame with a white background.</div>
+          <div class="info-row"><strong>Mode:</strong> {{ mode }}</div>
+          <div class="info-row"><strong>Rotate:</strong> {{ rotateDeg }}°</div>
+          <div class="info-hint">Crop = cover (fills target). Scale = contain (letterbox with white background). Dithering happens on-device.</div>
         </div>
 
         <div class="setting-row">
-          <label for="primary-variant">Primary orientation</label>
+          <label for="target-orientation">Target orientation</label>
           <select
-            id="primary-variant"
-            :value="primaryVariant"
+            id="target-orientation"
+            :value="targetOrientation"
             :disabled="processing || uploading"
-            @change="primaryVariant = (($event.target as HTMLSelectElement).value as UploadVariant)"
+            @change="targetOrientation = (($event.target as HTMLSelectElement).value as any)"
           >
+            <option value="auto">auto (use detected)</option>
             <option value="landscape">landscape (800×480)</option>
             <option value="portrait">portrait (480×800)</option>
+            <option value="square">square (480×480)</option>
           </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="mode">Mode</label>
+          <select
+            id="mode"
+            :value="mode"
+            :disabled="processing || uploading"
+            @change="mode = (($event.target as HTMLSelectElement).value as any)"
+          >
+            <option value="crop">crop (fill)</option>
+            <option value="scale">scale (fit)</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label>Rotate</label>
+          <div class="rotate-buttons">
+            <button class="btn-secondary btn-small" :disabled="processing || uploading" @click="rotateDeg = 0">0°</button>
+            <button class="btn-secondary btn-small" :disabled="processing || uploading" @click="rotateDeg = 90">90°</button>
+            <button class="btn-secondary btn-small" :disabled="processing || uploading" @click="rotateDeg = 180">180°</button>
+            <button class="btn-secondary btn-small" :disabled="processing || uploading" @click="rotateDeg = 270">270°</button>
+          </div>
         </div>
 
         <div v-if="error" class="error">{{ error }}</div>
@@ -240,43 +318,37 @@ function reset() {
           </label>
         </div>
 
-        <div v-if="file && !primaryPreviewUrl" class="preview-section">
+        <div v-else-if="file && !processedPreviewUrl" class="preview-section">
           <div class="preview-container">
             <img :src="previewUrl || undefined" alt="Preview" class="preview-image" />
           </div>
           <div class="button-group">
             <button @click="reset" class="btn-secondary" :disabled="processing">Cancel</button>
-            <button @click="showCropper = true" class="btn-secondary" :disabled="processing">Adjust Crop</button>
-            <button @click="processImages" class="btn-primary" :disabled="processing">
+            <button
+              v-if="mode === 'crop'"
+              @click="showCropper = true"
+              class="btn-secondary"
+              :disabled="processing || !workingImage || !cropParams"
+            >
+              Adjust Crop
+            </button>
+            <button @click="processImage" class="btn-primary" :disabled="processing">
               {{ processing ? 'Processing...' : 'Process & Dither' }}
             </button>
           </div>
         </div>
 
-        <div v-if="primaryPreviewUrl && alternatePreviewUrl" class="preview-section">
-          <div class="preview-grid">
-            <div class="preview-panel">
-              <div class="preview-title">Primary ({{ primaryVariant }})</div>
-              <div class="preview-container">
-                <img :src="primaryPreviewUrl || undefined" alt="Primary dithered preview" class="preview-image" />
-              </div>
-            </div>
-
-            <div class="preview-panel">
-              <div class="preview-title">Alternate ({{ alternateVariant }})</div>
-              <div class="preview-container">
-                <img
-                  :src="alternatePreviewUrl || undefined"
-                  alt="Alternate dithered preview"
-                  class="preview-image"
-                />
-              </div>
+        <div v-else class="preview-section">
+          <div class="preview-panel">
+            <div class="preview-title">Processed ({{ effectiveOrientation }}) — device will dither</div>
+            <div class="preview-container">
+              <img :src="processedPreviewUrl || undefined" alt="Processed dithered preview" class="preview-image" />
             </div>
           </div>
 
           <div class="button-group">
             <button @click="reset" class="btn-secondary" :disabled="uploading">Start Over</button>
-            <button @click="uploadImages" class="btn-primary" :disabled="uploading">
+            <button @click="uploadImage" class="btn-primary" :disabled="uploading">
               {{ uploading ? 'Uploading...' : 'Upload to Frame' }}
             </button>
           </div>
@@ -285,10 +357,10 @@ function reset() {
     </div>
 
     <ImageCropper
-      v-if="showCropper && loadedImage && cropParams"
-      :image="loadedImage"
-      :target-width="primaryDims.width"
-      :target-height="primaryDims.height"
+      v-if="showCropper && workingImage && cropParams && mode === 'crop'"
+      :image="workingImage"
+      :target-width="targetDims.width"
+      :target-height="targetDims.height"
       :initial-crop="cropParams"
       @update="handleCropUpdate"
       @close="showCropper = false"
@@ -485,6 +557,16 @@ h2 {
   display: flex;
   gap: 1rem;
   justify-content: flex-end;
+}
+
+.rotate-buttons {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.btn-small {
+  padding: 0.4rem 0.75rem;
 }
 
 .btn-primary,

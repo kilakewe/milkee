@@ -6,8 +6,10 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_chip_info.h"
 #include "freertos/semphr.h"
 #include "driver/rtc_io.h"
+#include "freertos/task.h"
 #include "i2c_bsp.h"
 #include "led_bsp.h"
 #include "sdcard_bsp.h"
@@ -231,12 +233,159 @@ static void Green_led_user_Task(void *arg)
 // Red LED blink half-period (ms). While charging we slow this down.
 static volatile uint32_t s_red_led_blink_ms = 100;
 
-// Cached charging state used for power management decisions.
-// Rule: never enter deep sleep while charging.
-static volatile bool s_is_charging = false;
+// Persisted across deep sleep (and often across soft resets) to help distinguish
+// "USB link flapping" from actual MCU reboots.
+RTC_DATA_ATTR static uint32_t s_boot_counter_rtc = 0;
+static uint32_t s_boot_id = 0;
 
 // Serialize PMU reads across tasks to avoid I2C contention.
 static SemaphoreHandle_t s_pmu_mutex = NULL;
+
+static const char *ResetReasonToString(esp_reset_reason_t r)
+{
+    switch (r)
+    {
+    case ESP_RST_POWERON:
+        return "POWERON";
+    case ESP_RST_EXT:
+        return "EXT";
+    case ESP_RST_SW:
+        return "SW";
+    case ESP_RST_PANIC:
+        return "PANIC";
+    case ESP_RST_INT_WDT:
+        return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+        return "TASK_WDT";
+    case ESP_RST_WDT:
+        return "WDT";
+    case ESP_RST_DEEPSLEEP:
+        return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT";
+    case ESP_RST_SDIO:
+        return "SDIO";
+    case ESP_RST_USB:
+        return "USB";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *WakeupCauseToString(esp_sleep_wakeup_cause_t c)
+{
+    switch (c)
+    {
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+        return "UNDEFINED";
+    case ESP_SLEEP_WAKEUP_ALL:
+        return "ALL";
+    case ESP_SLEEP_WAKEUP_EXT0:
+        return "EXT0";
+    case ESP_SLEEP_WAKEUP_EXT1:
+        return "EXT1";
+    case ESP_SLEEP_WAKEUP_TIMER:
+        return "TIMER";
+    case ESP_SLEEP_WAKEUP_TOUCHPAD:
+        return "TOUCHPAD";
+    case ESP_SLEEP_WAKEUP_ULP:
+        return "ULP";
+    case ESP_SLEEP_WAKEUP_GPIO:
+        return "GPIO";
+    case ESP_SLEEP_WAKEUP_UART:
+        return "UART";
+    case ESP_SLEEP_WAKEUP_WIFI:
+        return "WIFI";
+    case ESP_SLEEP_WAKEUP_COCPU:
+        return "COCPU";
+    case ESP_SLEEP_WAKEUP_COCPU_TRAP_TRIG:
+        return "COCPU_TRAP";
+    case ESP_SLEEP_WAKEUP_BT:
+        return "BT";
+    case ESP_SLEEP_WAKEUP_VAD:
+        return "VAD";
+    case ESP_SLEEP_WAKEUP_VBAT_UNDER_VOLT:
+        return "VBAT_UNDER_VOLT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void BootDiagnosticsTask(void *arg)
+{
+    (void)arg;
+
+    // Delay so the serial monitor has time to reattach after USB re-enumeration.
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    const esp_reset_reason_t rr = esp_reset_reason();
+    const esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+    const uint32_t up_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+    // Basic chip + heap snapshot.
+    esp_chip_info_t chip = {};
+    esp_chip_info(&chip);
+
+    // Keep this log strictly 32-bit types to avoid nano printf varargs pitfalls.
+    ESP_LOGW("bootdiag",
+             "boot_id=%u uptime_ms=%u reset=%d wake=%d cores=%d rev=%d",
+             (unsigned)s_boot_id,
+             (unsigned)up_ms,
+             (int)rr,
+             (int)wc,
+             (int)chip.cores,
+             (int)chip.revision);
+
+    ESP_LOGW("bootdiag", "reset_str=%s wake_str=%s", ResetReasonToString(rr), WakeupCauseToString(wc));
+
+    ESP_LOGW("bootdiag",
+             "heap_free=%u heap_min_free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+
+    // Best-effort PMU snapshot.
+    bool took = true;
+    if (s_pmu_mutex)
+    {
+        took = (xSemaphoreTake(s_pmu_mutex, pdMS_TO_TICKS(200)) == pdTRUE);
+    }
+
+    if (took)
+    {
+        const bool charging = axp2101_is_charging();
+        const bool vbus_in = axp2101_is_vbus_in();
+        const bool vbus_good = axp2101_is_vbus_good();
+        const int batt_mv = axp2101_get_batt_voltage_mv();
+        const int vbus_mv = axp2101_get_vbus_voltage_mv();
+        const int sys_mv = axp2101_get_sys_voltage_mv();
+        const int chg_status = axp2101_get_charger_status();
+
+        ESP_LOGW("bootdiag",
+                 "pmu charging=%d vbus_in=%d vbus_good=%d batt_mv=%d vbus_mv=%d sys_mv=%d chg_status=%d",
+                 (int)charging,
+                 (int)vbus_in,
+                 (int)vbus_good,
+                 batt_mv,
+                 vbus_mv,
+                 sys_mv,
+                 chg_status);
+
+        if (s_pmu_mutex)
+        {
+            xSemaphoreGive(s_pmu_mutex);
+        }
+    }
+    else
+    {
+        ESP_LOGW("bootdiag", "pmu snapshot skipped (mutex timeout)");
+    }
+
+    vTaskDelete(NULL);
+}
+
+// Cached charging state used for power management decisions.
+// Rule: never enter deep sleep while charging.
+static volatile bool s_is_charging = false;
 
 static inline bool IsChargingCached()
 {
@@ -337,6 +486,27 @@ static void ChargingStatusLedTask(void *arg)
     }
 }
 
+static void BrowserUploadWaitForNetworkQuiet(uint32_t quiet_ms, uint32_t max_wait_ms)
+{
+    const uint64_t quiet_us = (uint64_t)quiet_ms * 1000ULL;
+    const uint64_t max_wait_us = (uint64_t)max_wait_ms * 1000ULL;
+
+    const uint64_t start = esp_timer_get_time();
+    while ((esp_timer_get_time() - start) < max_wait_us)
+    {
+        const uint64_t now = esp_timer_get_time();
+        const uint64_t last = server_bsp_get_last_activity_us();
+
+        // If we've been quiet long enough (or activity is unset), allow refresh.
+        if (last == 0 || now < last || (now - last) >= quiet_us)
+        {
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 // Minimal "app" that:
 // - runs a Wi-Fi AP + HTTP server (see components/http_server_bsp)
 // - accepts a raw 24-bit BMP via POST /dataUP
@@ -372,63 +542,56 @@ static void BrowserImageUploadDisplayTask(void *arg)
         const EventBits_t wait_mask = set_bit_button(0) | set_bit_button(2) | set_bit_button(3);
         EventBits_t bits = xEventGroupWaitBits(server_groups, wait_mask, pdTRUE, pdFALSE, portMAX_DELAY);
 
-        if (get_bit_button(bits, 0))
-        {
-            // Start green blinking as soon as an image upload begins.
-            if (!Green_led_arg)
-            {
-                Green_led_arg = 1;
-                xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
-            }
-        }
-
-        if (get_bit_button(bits, 3))
-        {
-            // Upload failed; stop green blinking.
-            Green_led_arg = 0;
-        }
+        // Upload state notifications used to drive status LEDs.
+        // (Disabled: user requested no blinking lights.)
 
         if (!get_bit_button(bits, 2))
         {
             continue;
         }
 
+        // Avoid overlapping bursts of Wi-Fi traffic (follow-up HTTP GETs) with an
+        // e-paper refresh, which can cause large peak current draw on some supplies.
+        BrowserUploadWaitForNetworkQuiet(/*quiet_ms=*/600, /*max_wait_ms=*/5000);
+
         if (pdTRUE == xSemaphoreTake(epaper_gui_semapHandle, pdMS_TO_TICKS(2000)))
         {
-            // Keep green blinking while drawing.
-            if (!Green_led_arg)
-            {
-                Green_led_arg = 1;
-                xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(6));
-            }
-
             // Re-init the paint buffer for the current rotation.
             // IMPORTANT: Paint_SetRotate() does not update Paint.Width/Paint.Height, so for 90/270
             // we must call Paint_NewImage() to swap the logical dimensions safely.
             const uint16_t rotation = server_bsp_get_rotation();
-            const uint16_t img_rotation = server_bsp_get_image_rotation();
             Paint_NewImage(epd_blackImage, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, rotation, EPD_7IN3E_WHITE);
             Paint_SetScale(6);
             Paint_SelectImage(epd_blackImage);
-
-            // Render the current picture.
-            // Note: Paint_NewImage(..., rotation, ...) controls how the framebuffer is rotated onto the panel.
-            // To avoid "canceling out" the frame rotation (e.g. 90 -> 270), only use the rotate helper to
-            // fix orientation *mismatches* (portrait vs landscape). Exact frame rotation differences are handled
-            // by Paint.Rotate.
-            const uint16_t dst_canvas = ((rotation == ROTATE_90) || (rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
-            const uint16_t src_canvas = ((img_rotation == ROTATE_90) || (img_rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
+            Paint_Clear(EPD_7IN3E_WHITE);
 
             const char *img_path = server_bsp_get_current_image_path();
             if (img_path && img_path[0] != '\0')
             {
-                GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, src_canvas, dst_canvas);
+                int iw = 0;
+                int ih = 0;
+                const bool ok = GUI_Bmp_GetDimensions(img_path, &iw, &ih);
+                if (ok && iw > 0 && ih > 0)
+                {
+                    const bool img_square = (iw == ih);
+                    const bool img_landscape = (iw > ih);
+                    const bool frame_landscape = (Paint.Width >= Paint.Height);
+                    const bool mismatch = (!img_square) && (img_landscape != frame_landscape);
+
+                    // If orientations differ, fit-scale to the frame; otherwise just center (no upscale).
+                    const bool allow_upscale = mismatch;
+                    GUI_DrawBmp_RGB_6Color_Fit(img_path, 0, 0, Paint.Width, Paint.Height, allow_upscale);
+                }
+                else
+                {
+                    // Fallback: best-effort draw without scaling.
+                    GUI_ReadBmp_RGB_6Color(img_path, 0, 0);
+                }
             }
 
             epaper_port_display(epd_blackImage);
 
             xSemaphoreGive(epaper_gui_semapHandle);
-            Green_led_arg = 0;
         }
     }
 }
@@ -449,20 +612,32 @@ static void BrowserUploadRenderCurrentOnce(void)
     if (pdTRUE == xSemaphoreTake(epaper_gui_semapHandle, pdMS_TO_TICKS(5000)))
     {
         const uint16_t rotation = server_bsp_get_rotation();
-        const uint16_t img_rotation = server_bsp_get_image_rotation();
 
         Paint_NewImage(epd_blackImage, EXAMPLE_LCD_WIDTH, EXAMPLE_LCD_HEIGHT, rotation, EPD_7IN3E_WHITE);
         Paint_SetScale(6);
         Paint_SelectImage(epd_blackImage);
         Paint_Clear(EPD_7IN3E_WHITE);
 
-        const uint16_t dst_canvas = ((rotation == ROTATE_90) || (rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
-        const uint16_t src_canvas = ((img_rotation == ROTATE_90) || (img_rotation == ROTATE_270)) ? ROTATE_90 : ROTATE_0;
-
         const char *img_path = server_bsp_get_current_image_path();
         if (img_path && img_path[0] != '\0')
         {
-            GUI_ReadBmp_RGB_6Color_Rotate(img_path, 0, 0, src_canvas, dst_canvas);
+            int iw = 0;
+            int ih = 0;
+            const bool ok = GUI_Bmp_GetDimensions(img_path, &iw, &ih);
+            if (ok && iw > 0 && ih > 0)
+            {
+                const bool img_square = (iw == ih);
+                const bool img_landscape = (iw > ih);
+                const bool frame_landscape = (Paint.Width >= Paint.Height);
+                const bool mismatch = (!img_square) && (img_landscape != frame_landscape);
+
+                const bool allow_upscale = mismatch;
+                GUI_DrawBmp_RGB_6Color_Fit(img_path, 0, 0, Paint.Width, Paint.Height, allow_upscale);
+            }
+            else
+            {
+                GUI_ReadBmp_RGB_6Color(img_path, 0, 0);
+            }
         }
 
         epaper_port_display(epd_blackImage);
@@ -517,7 +692,7 @@ static void BrowserUploadIdleSleepTask(void *arg)
             esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
             const uint64_t mask = 1ULL << kWakeKeyPin;
-            ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ALL_LOW));
+            ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
             ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
             ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
 
@@ -593,6 +768,9 @@ void axp2101_irq_init(void)
 
 uint8_t User_Mode_init(void)
 {
+    // Increment early so we can detect real reboots even if the monitor attaches late.
+    s_boot_id = ++s_boot_counter_rtc;
+
     epaper_gui_semapHandle = xSemaphoreCreateMutex(); /* Acquire the mutual exclusion lock to prevent re-flashing */
     i2c_master_Init();                                /* Must be initialized */
     // axp2101_irq_init();                             /* AXP2101 Wakeup Settings */
@@ -607,10 +785,14 @@ uint8_t User_Mode_init(void)
     // Prime charging cache early so sleep policy is correct immediately after boot.
     s_is_charging = PmuIsCharging();
 
-    led_init();          /* LED Blink Initialization */
-    epaper_port_init();  /* Ink Display Initialization */
+    led_init();         /* LED Blink Initialization */
+    epaper_port_init(); /* Ink Display Initialization */
 
-    ESP_LOGI("reset", "esp_reset_reason=%d", (int)esp_reset_reason());
+    // Immediate boot marker (may be missed if host attaches late).
+    ESP_LOGI("boot", "boot_id=%u esp_reset_reason=%d", (unsigned)s_boot_id, (int)esp_reset_reason());
+
+    // Delayed marker + extended snapshot (helps when USB re-enumeration causes late attach).
+    xTaskCreate(BootDiagnosticsTask, "BootDiagnosticsTask", 4 * 1024, NULL, 3, NULL);
 
     // #if CONFIG_BOARD_TYPE_ESP32S3_PhotoPaint
     // Always render a 4x4 color-index test pattern (0x0..0xF) on boot for the PhotoPainter board.
@@ -624,6 +806,13 @@ uint8_t User_Mode_init(void)
 
     // Load rotation/slideshow/library state from NVS/SD.
     server_bsp_init_state();
+
+    // Ensure the server event group exists even if the HTTP server is disabled.
+    // Some tasks (e.g. BrowserImageUploadDisplayTask) wait on this handle.
+    if (!server_groups)
+    {
+        server_groups = xEventGroupCreate();
+    }
 
     const esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
 
@@ -644,7 +833,7 @@ uint8_t User_Mode_init(void)
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
         const uint64_t mask = 1ULL << kWakeKeyPin;
-        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ALL_LOW));
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
         ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
         ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
 
@@ -662,8 +851,7 @@ uint8_t User_Mode_init(void)
         // No-op.
     }
 
-    Green_led_Mode_queue = xEventGroupCreate();
-    Red_led_Mode_queue = xEventGroupCreate();
+    // Status LED blinking disabled.
     epaper_groups = xEventGroupCreate();
     /*GPIO */
     gpio_config_t gpio_conf = {};
@@ -681,23 +869,22 @@ uint8_t User_Mode_init(void)
     button_Init();
     xTaskCreate(key1_button_user_Task, "key1_button_user_Task", 4 * 1024, NULL, 3, NULL);
     xTaskCreate(BrowserUploadKeyNextTask, "BrowserUploadKeyNextTask", 4 * 1024, NULL, 3, NULL);
-    xTaskCreate(Green_led_user_Task, "Green_led_user_Task", 3 * 1024, &Green_led_arg, 2, NULL);
-    xTaskCreate(Red_led_user_Task, "Red_led_user_Task", 3 * 1024, &Red_led_arg, 2, NULL);
+    // Status LED blinking disabled.
 
     // NOTE: Avoid running multiple PMU polling tasks concurrently; it can cause I2C errors/resets.
     // If you want periodic PMU logging, re-enable this task (but keep it mutually exclusive with other PMU reads).
     // xTaskCreate(axp2101_isCharging_task, "axp2101_isCharging_task", 3 * 1024, NULL, 2, NULL);
 
     // Browser upload app
-    Network_wifi_ap_init();
+    Network_wifi_init();
     http_server_init();
 
     // Charging state poller (controls LED blink + sleep gating).
-    xTaskCreate(ChargingStatusLedTask, "ChargingStatusLedTask", 3 * 1024, NULL, 2, NULL);
+    // xTaskCreate(ChargingStatusLedTask, "ChargingStatusLedTask", 3 * 1024, NULL, 2, NULL);
 
-    // Heartbeat: blink red LED while the device is awake.
-    Red_led_arg = 1;
-    xEventGroupSetBits(Red_led_Mode_queue, set_bit_button(6));
+    // Status LED blinking disabled.
+    led_set(LED_PIN_Red, LED_OFF);
+    led_set(LED_PIN_Green, LED_OFF);
 
     xTaskCreate(BrowserImageUploadDisplayTask, "BrowserImageUploadDisplayTask", 6 * 1024, NULL, 2, NULL);
     xTaskCreate(BrowserUploadIdleSleepTask, "BrowserUploadIdleSleepTask", 4 * 1024, NULL, 2, NULL);

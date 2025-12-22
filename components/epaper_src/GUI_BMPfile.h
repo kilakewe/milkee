@@ -49,6 +49,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "DEV_Config.h"
 
@@ -99,6 +100,15 @@ UBYTE GUI_ReadBmp_RGB_6Color(const char *path, UWORD Xstart, UWORD Ystart);
 // Draw a 24-bit BMP (6-color palette) and rotate it from srcRotate to dstRotate.
 // Rotations are degrees: 0, 90, 180, 270.
 UBYTE GUI_ReadBmp_RGB_6Color_Rotate(const char *path, UWORD Xstart, UWORD Ystart, UWORD srcRotate, UWORD dstRotate);
+
+// Read BMP dimensions (24-bit expected for PhotoPainter).
+// Returns true on success.
+bool GUI_Bmp_GetDimensions(const char *path, int *out_width, int *out_height);
+
+// Draw a 24-bit BMP (6-color palette) fit-scaled into a box and centered.
+// If allow_upscale is false, images smaller than the box are not upscaled.
+UBYTE GUI_DrawBmp_RGB_6Color_Fit(const char *path, UWORD Xstart, UWORD Ystart, UWORD boxW, UWORD boxH, bool allow_upscale);
+
 UBYTE GUI_ReadBmp_RGB_7Color(const char *path, UWORD Xstart, UWORD Ystart);
 
 

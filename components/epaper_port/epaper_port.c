@@ -232,6 +232,12 @@ void epaper_port_init(void) {
 
     epaper_SendCommand(0x04); //PWR on
     epaper_readbusyh();       //waiting for the electronic paper IC to release the idle signal
+
+    // Leave the panel powered off until we actually refresh.
+    // This reduces idle draw while serving the web UI and helps avoid brownouts.
+    epaper_SendCommand(0x02); // POWER_OFF
+    epaper_SendData(0X00);
+    epaper_readbusyh();
 }
 
 /*

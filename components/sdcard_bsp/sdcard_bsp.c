@@ -18,28 +18,29 @@ static const char *TAG = "_sdcard";
 #define SDMMC_CLK_PIN 39
 #define SDMMC_CMD_PIN 41
 
-#define SDlist "/sdcard" 
+#define SDlist "/sdcard"
 
 sdmmc_card_t *card_host = NULL;
 
 list_t *sdcard_scan_listhandle = NULL;
 
-static list_node_t *Currently_node = NULL; 
+static list_node_t *Currently_node = NULL;
 
 uint8_t _sdcard_init(void) {
     sdcard_scan_listhandle = list_new();
     esp_vfs_fat_sdmmc_mount_config_t mount_config =
         {
-            .format_if_mount_failed = false,         
-            .max_files              = 5,             
-            .allocation_unit_size   = 16 * 1024 * 3, 
+            .format_if_mount_failed = false,
+            .max_files              = 5,
+            .allocation_unit_size   = 16 * 1024 * 3,
         };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    // Reduce peak IO current draw (helps avoid brownouts on weak supplies).
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width               = 4; 
+    slot_config.width               = 4;
     slot_config.clk                 = SDMMC_CLK_PIN;
     slot_config.cmd                 = SDMMC_CMD_PIN;
     slot_config.d0                  = SDMMC_D0_PIN;
@@ -95,7 +96,7 @@ int sdcard_write_file(const char *path, const void *data, size_t data_len) {
 * @brief Read all data from the file
 * @param path   File path
 * @param buffer Buffer to store the read data
-* @param outLen Number of bytes actually read 
+* @param outLen Number of bytes actually read
 */
 int sdcard_read_file(const char *path, uint8_t *buffer, size_t *outLen) {
     if (card_host == NULL) {
@@ -138,7 +139,7 @@ int sdcard_read_file(const char *path, uint8_t *buffer, size_t *outLen) {
 * @param buffer Buffer to store the data
 * @param len    Length to read
 * @param offset Offset position
-* @param outLen Actual read length (can be NULL) 
+* @param outLen Actual read length (can be NULL)
 */
 int sdcard_read_offset(const char *path, void *buffer, size_t len, size_t offset) {
     if (card_host == NULL) {
@@ -213,13 +214,13 @@ void list_scan_dir(const char *path) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR) { 
+        if (entry->d_type == DT_DIR) {
             ESP_LOGI("sdscan", "Directory: %s", entry->d_name);
         } else {
             if (strstr(entry->d_name, ".bmp") == NULL) {
                 continue;
             }
-            uint16_t       _strlen   = strlen(path) + strlen(entry->d_name) + 1 + 1; 
+            uint16_t       _strlen   = strlen(path) + strlen(entry->d_name) + 1 + 1;
             sdcard_node_t *node_data = (sdcard_node_t *) LIST_MALLOC(sizeof(sdcard_node_t));
             assert(node_data);
             if (_strlen > 96) {
@@ -227,17 +228,17 @@ void list_scan_dir(const char *path) {
                 continue;
             }
             node_data->name_score = 0;
-            snprintf(node_data->sdcard_name, sizeof(node_data->sdcard_name) - 2, "%s/%s", path, entry->d_name); 
-            list_rpush(sdcard_scan_listhandle, list_node_new(node_data));                                       
+            snprintf(node_data->sdcard_name, sizeof(node_data->sdcard_name) - 2, "%s/%s", path, entry->d_name);
+            list_rpush(sdcard_scan_listhandle, list_node_new(node_data));
         }
     }
     closedir(dir);
 }
 
-int list_iterator(void) 
+int list_iterator(void)
 {
     int              Quantity = 0;
-    list_iterator_t *it       = list_iterator_new(sdcard_scan_listhandle, LIST_HEAD); 
+    list_iterator_t *it       = list_iterator_new(sdcard_scan_listhandle, LIST_HEAD);
     list_node_t     *node     = list_iterator_next(it);
     while (node != NULL) {
         sdcard_node_t *sdcard_node = (sdcard_node_t *) node->val;
@@ -245,7 +246,7 @@ int list_iterator(void)
         node = list_iterator_next(it);
         Quantity++;
     }
-    list_iterator_destroy(it); 
+    list_iterator_destroy(it);
     return Quantity;
 }
 

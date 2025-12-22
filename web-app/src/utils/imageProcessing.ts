@@ -282,12 +282,74 @@ export function imageToBMP(imageData: ImageData): Blob {
 }
 
 /**
- * Get target dimensions based on rotation
+ * Get target dimensions based on device rotation
  */
 export function getTargetDimensions(rotation: number): { width: number; height: number } {
   if (rotation === 0 || rotation === 180) {
     return { width: 800, height: 480 }
   } else {
     return { width: 480, height: 800 }
+  }
+}
+
+export type ImageOrientation = 'landscape' | 'portrait' | 'square'
+
+export function getOrientationFromDimensions(width: number, height: number): ImageOrientation {
+  if (width === height) return 'square'
+  return width > height ? 'landscape' : 'portrait'
+}
+
+export function getTargetDimensionsForOrientation(orientation: ImageOrientation): { width: number; height: number } {
+  switch (orientation) {
+    case 'landscape':
+      return { width: 800, height: 480 }
+    case 'portrait':
+      return { width: 480, height: 800 }
+    case 'square':
+      return { width: 480, height: 480 }
+  }
+}
+
+export async function rotateImageElement(
+  img: HTMLImageElement,
+  rotation: 0 | 90 | 180 | 270,
+): Promise<HTMLImageElement> {
+  const rot = ((rotation % 360) + 360) % 360
+  if (rot === 0) return img
+
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Failed to get canvas context')
+
+  if (rot === 90 || rot === 270) {
+    canvas.width = img.height
+    canvas.height = img.width
+  } else {
+    canvas.width = img.width
+    canvas.height = img.height
+  }
+
+  ctx.translate(canvas.width / 2, canvas.height / 2)
+  ctx.rotate((rot * Math.PI) / 180)
+  ctx.drawImage(img, -img.width / 2, -img.height / 2)
+
+  const blob: Blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((b) => {
+      if (!b) reject(new Error('Failed to encode rotated image'))
+      else resolve(b)
+    }, 'image/png')
+  })
+
+  const url = URL.createObjectURL(blob)
+  try {
+    const out = new Image()
+    const loaded: HTMLImageElement = await new Promise((resolve, reject) => {
+      out.onload = () => resolve(out)
+      out.onerror = () => reject(new Error('Failed to load rotated image'))
+      out.src = url
+    })
+    return loaded
+  } finally {
+    URL.revokeObjectURL(url)
   }
 }

@@ -16,6 +16,19 @@ void axp2101_isCharging_task(void *arg);
 // Returns true when the PMU reports the battery is charging.
 bool axp2101_is_charging(void);
 
+// Lightweight PMU telemetry helpers (best-effort; return 0/false on failure).
+// Units: millivolts.
+int axp2101_get_batt_voltage_mv(void);
+int axp2101_get_vbus_voltage_mv(void);
+int axp2101_get_sys_voltage_mv(void);
+
+bool axp2101_is_vbus_in(void);
+bool axp2101_is_vbus_good(void);
+
+// Raw charger status enum as returned by XPowersLib.
+// (Kept numeric here to avoid coupling callers to XPowers headers.)
+int axp2101_get_charger_status(void);
+
 #ifdef __cplusplus
 }
 #endif

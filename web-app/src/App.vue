@@ -2,15 +2,14 @@
 import { RouterView, RouterLink, useRoute } from 'vue-router'
 import { computed } from 'vue'
 import { useToast } from '@/composables/useToast'
-import { usePhotoFrameStore } from '@/stores/photoframe'
 import { api } from '@/services/api'
 import Toast from '@/components/Toast.vue'
 
 const route = useRoute()
 const toast = useToast()
-const store = usePhotoFrameStore()
 const isGallery = computed(() => route.name === 'gallery')
 const isSettings = computed(() => route.name === 'settings')
+const isWifi = computed(() => route.name === 'wifi')
 
 async function skipPhoto() {
   try {
@@ -45,6 +44,13 @@ async function skipPhoto() {
                 :class="isSettings ? 'border-pf-primary text-pf-light' : 'border-transparent text-gray-400 hover:border-pf-primary/20 hover:text-pf-light'"
               >
                 Settings
+              </RouterLink>
+              <RouterLink 
+                to="/wifi" 
+                class="inline-flex items-center border-b-2 px-1 pt-1 text-sm font-medium transition-colors"
+                :class="isWifi ? 'border-pf-primary text-pf-light' : 'border-transparent text-gray-400 hover:border-pf-primary/20 hover:text-pf-light'"
+              >
+                Wi‑Fi
               </RouterLink>
             </div>
           </div>
@@ -81,6 +87,13 @@ async function skipPhoto() {
             :class="isSettings ? 'border-pf-primary bg-pf-primary/10 text-pf-light' : 'border-transparent text-gray-400 hover:border-pf-primary/20 hover:bg-pf-primary/5 hover:text-pf-light'"
           >
             Settings
+          </RouterLink>
+          <RouterLink 
+            to="/wifi" 
+            class="block border-l-4 py-2 pr-4 pl-3 text-base font-medium sm:pr-6 sm:pl-5 transition-colors"
+            :class="isWifi ? 'border-pf-primary bg-pf-primary/10 text-pf-light' : 'border-transparent text-gray-400 hover:border-pf-primary/20 hover:bg-pf-primary/5 hover:text-pf-light'"
+          >
+            Wi‑Fi
           </RouterLink>
         </div>
       </div>

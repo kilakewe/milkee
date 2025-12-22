@@ -1,6 +1,6 @@
-## Upload API
+## Upload API (legacy)
 ### `POST /dataUP`
-Upload a 24-bit BMP.
+Upload a raw 24-bit BMP (legacy endpoint).
 
 Request
 - Body: raw BMP bytes.
@@ -16,12 +16,40 @@ Behavior
 - Each upload creates a new file like:
   - `img_000123_r180.bmp`
 - Sets the newly uploaded file as the **current** photo.
-- Remembers the rotation used at upload time (used to correctly rotate the current photo later).
 - Triggers a redraw on the e-paper.
 
 Response
 - On success: HTTP 200 with text `上传成功`
 - On failure: HTTP 200 with text `上传失败` (or an HTTP error if the request fails early)
+
+## Upload API (Photo library)
+### `POST /api/photos/upload`
+Upload a 24-bit BMP (full color). The device will dither/quantize it for the e-paper palette during display.
+
+Request
+- Query params:
+  - `orientation=landscape|portrait|square` (preferred)
+  - `variant=landscape|portrait` (legacy, still supported)
+  - `id=<photo id>` (optional; used by legacy two-step upload to attach a second variant)
+- Headers:
+  - `Content-Type: image/bmp`
+- Body: raw BMP bytes
+
+Expected dimensions
+- `landscape`: `800x480`
+- `portrait`: `480x800`
+- `square`: `480x480`
+
+Behavior
+- Stores the uploaded BMP to the SD card under `/sdcard/user/current-img/`.
+- Allocates a new `img_XXXXXX` photo id when `id` is not provided.
+- Updates `library.json` to reference the stored filename.
+- For single-image uploads (`orientation=`), the uploaded photo becomes the current photo immediately.
+
+Response
+- Content-Type: `application/json`
+- Example:
+  - `{ "ok": true, "id": "img_000123", "variant": "square", "filename": "img_000123_S_r0.bmp" }`
 
 ## Rotation API
 ### `GET /api/rotation`

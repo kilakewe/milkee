@@ -229,11 +229,14 @@ export const handlers = [
     await delay(800)
 
     const url = new URL(request.url)
-    const variant = url.searchParams.get('variant')
+    const variantParam = url.searchParams.get('variant')
+    const orientationParam = url.searchParams.get('orientation')
     const idParam = url.searchParams.get('id')?.trim()
 
-    if (variant !== 'landscape' && variant !== 'portrait') {
-      return new HttpResponse('Missing/invalid variant', { status: 400 })
+    const variant = (orientationParam || variantParam) as string | null
+
+    if (variant !== 'landscape' && variant !== 'portrait' && variant !== 'square') {
+      return new HttpResponse('Missing/invalid orientation', { status: 400 })
     }
 
     const blob = await request.blob()
@@ -257,9 +260,11 @@ export const handlers = [
       photos.push(p)
     }
 
-    const filename = variant === 'landscape' ? `${id}_L_r0.bmp` : `${id}_P_r90.bmp`
-    if (variant === 'landscape') p.landscape = filename
-    else p.portrait = filename
+    const filename =
+      variant === 'landscape' ? `${id}_L_r0.bmp` : variant === 'portrait' ? `${id}_P_r90.bmp` : `${id}_S_r0.bmp`
+
+    if (variant === 'portrait') p.portrait = filename
+    else p.landscape = filename
 
     currentPhotoId = id
 

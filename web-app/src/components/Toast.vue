@@ -1,7 +1,7 @@
+<!-- eslint-disable vue/multi-word-component-names -->
 <script setup lang="ts">
 import { ToastProvider, ToastRoot, ToastTitle, ToastDescription, ToastClose, ToastViewport } from 'radix-vue'
 import { useToast } from '@/composables/useToast'
-import { computed } from 'vue'
 
 const { toasts, dismiss } = useToast()
 

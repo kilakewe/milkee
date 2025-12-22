@@ -1,6 +1,8 @@
 import type { PhotoFrameState } from '@/stores/photoframe'
 
-const API_BASE = import.meta.env.VITE_API_BASE || ''
+// In production (served from the device), always use same-origin.
+// In dev, you can point at a device IP via VITE_API_BASE.
+const API_BASE = import.meta.env.DEV ? (import.meta.env.VITE_API_BASE || '') : ''
 
 export interface RotationResponse {
   rotation: number
@@ -33,13 +35,30 @@ export interface ReorderPhotosResponse {
   ok: boolean
 }
 
-export type UploadVariant = 'landscape' | 'portrait'
+export type UploadOrientation = 'landscape' | 'portrait' | 'square'
 
 export interface UploadPhotoResponse {
   ok: boolean
   id: string
-  variant: UploadVariant
+  variant: UploadOrientation
   filename: string
+}
+
+export type WifiMode = 'sta' | 'ap' | 'none'
+
+export interface WifiStatusResponse {
+  configured: boolean
+  mode: WifiMode
+  connected: boolean
+  ssid: string
+  ip: string
+  ap_ssid: string
+  ap_ip: string
+}
+
+export interface WifiConfigResponse {
+  ok: boolean
+  rebooting: boolean
 }
 
 export const api = {
@@ -122,8 +141,11 @@ export const api = {
     return await response.json()
   },
 
-  async uploadPhotoVariant(variant: UploadVariant, bmpData: Blob, id?: string): Promise<UploadPhotoResponse> {
-    const params = new URLSearchParams({ variant })
+  async uploadPhoto(orientation: UploadOrientation, bmpData: Blob, id?: string): Promise<UploadPhotoResponse> {
+    // New firmware supports `orientation=` (landscape|portrait|square).
+    // We also send `variant=` for backward compatibility.
+    const params = new URLSearchParams({ orientation })
+    params.set('variant', orientation)
     if (id) params.set('id', id)
 
     const response = await fetch(`${API_BASE}/api/photos/upload?${params.toString()}`, {
@@ -133,6 +155,32 @@ export const api = {
     })
 
     if (!response.ok) throw new Error('Upload failed')
+    return await response.json()
+  },
+
+  async getWifiStatus(): Promise<WifiStatusResponse> {
+    const response = await fetch(`${API_BASE}/api/wifi/status`)
+    if (!response.ok) throw new Error('Failed to fetch Wi-Fi status')
+    return await response.json()
+  },
+
+  async setWifiConfig(ssid: string, password: string): Promise<WifiConfigResponse> {
+    const response = await fetch(`${API_BASE}/api/wifi/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssid, password }),
+    })
+
+    if (!response.ok) throw new Error('Failed to save Wi-Fi config')
+    return await response.json()
+  },
+
+  async clearWifiConfig(): Promise<WifiConfigResponse> {
+    const response = await fetch(`${API_BASE}/api/wifi/clear`, {
+      method: 'POST',
+    })
+
+    if (!response.ok) throw new Error('Failed to clear Wi-Fi config')
     return await response.json()
   },
 

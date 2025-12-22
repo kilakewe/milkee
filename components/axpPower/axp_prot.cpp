@@ -227,6 +227,37 @@ bool axp2101_is_charging(void)
     return axp2101.isCharging();
 }
 
+int axp2101_get_batt_voltage_mv(void)
+{
+    // XPowers returns millivolts.
+    return (int)axp2101.getBattVoltage();
+}
+
+int axp2101_get_vbus_voltage_mv(void)
+{
+    return (int)axp2101.getVbusVoltage();
+}
+
+int axp2101_get_sys_voltage_mv(void)
+{
+    return (int)axp2101.getSystemVoltage();
+}
+
+bool axp2101_is_vbus_in(void)
+{
+    return axp2101.isVbusIn();
+}
+
+bool axp2101_is_vbus_good(void)
+{
+    return axp2101.isVbusGood();
+}
+
+int axp2101_get_charger_status(void)
+{
+    return (int)axp2101.getChargerStatus();
+}
+
 void axp2101_isCharging_task(void *arg) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20000));

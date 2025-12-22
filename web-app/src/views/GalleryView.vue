@@ -57,18 +57,6 @@ async function handleDelete(id: string) {
   }
 }
 
-async function handleNext() {
-  try {
-    store.setLoading(true)
-    await api.nextPhoto()
-    await loadPhotos()
-    toast.success('Next photo', 'Moved to next photo in rotation')
-  } catch (err) {
-    toast.error('Failed to go to next photo', err instanceof Error ? err.message : undefined)
-    store.setLoading(false)
-  }
-}
-
 function handleMove(id: string, direction: 'up' | 'down') {
   const idx = store.photos.findIndex((p) => p.id === id)
   if (idx === -1) return
