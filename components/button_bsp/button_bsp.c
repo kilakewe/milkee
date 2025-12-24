@@ -129,7 +129,9 @@ static void on_button2_single_click(Button *btn_handle) {
 
 /*Double-click*/
 static void on_button2_double_click(Button *btn_handle) {
-    //xEventGroupSetBits(key_groups,set_bit_button(0));
+    (void)btn_handle;
+    // Signal a distinct event bit so firmware can differentiate single vs double click.
+    xEventGroupSetBits(key_groups, set_bit_button(3));
 }
 
 /*Long press*/

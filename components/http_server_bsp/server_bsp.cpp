@@ -1711,16 +1711,31 @@ static esp_err_t server_bsp_send_sd_file(httpd_req_t *req, const char *sd_path)
 
     ESP_LOGI(TAG, "Serving SD file: %s", sd_path);
 
+    esp_err_t send_err = ESP_OK;
     while (len)
     {
-        httpd_resp_send_chunk(req, resp_str, len);
+        send_err = httpd_resp_send_chunk(req, resp_str, len);
+        if (send_err != ESP_OK)
+        {
+            // Common case: client navigated away / disconnected while we were streaming.
+            // Stop reading/sending to avoid spamming httpd_txrx send() errors.
+            ESP_LOGW(TAG, "Failed to send chunk for %s (%d)", sd_path, (int)send_err);
+            break;
+        }
+
         off += len;
         len = sdcard_read_offset(sd_path, resp_str, SEND_LEN_MAX, off);
     }
 
-    httpd_resp_send_chunk(req, NULL, 0);
+    if (send_err == ESP_OK)
+    {
+        (void)httpd_resp_send_chunk(req, NULL, 0);
+    }
+
     heap_caps_free(resp_str);
-    return ESP_OK;
+
+    // If the socket is already broken, returning ESP_FAIL tells httpd to close it.
+    return (send_err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 static bool server_bsp_uri_is_safe(const char *uri)

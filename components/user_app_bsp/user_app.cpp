@@ -1348,6 +1348,7 @@ static void BrowserUploadIdleSleepTask(void *arg)
 
     constexpr uint64_t kIdleTimeoutUs = 5ULL * 60ULL * 1000000ULL;
     constexpr gpio_num_t kWakeKeyPin = GPIO_NUM_4; // Key button (active-low)
+    constexpr gpio_num_t kWakePwrPin = GPIO_NUM_5; // Power button (active-high)
 
     for (;;)
     {
@@ -1372,7 +1373,7 @@ static void BrowserUploadIdleSleepTask(void *arg)
                 continue;
             }
 
-            ESP_LOGI("browser_upload", "Idle for 5 minutes; entering deep sleep (wake on key button + optional timer)");
+            ESP_LOGI("browser_upload", "Idle for 5 minutes; entering deep sleep (wake on key + power + optional timer)");
 
             // Stop status LEDs before sleeping.
             Red_led_arg = 0;
@@ -1390,6 +1391,11 @@ static void BrowserUploadIdleSleepTask(void *arg)
             ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
             ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
             ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
+
+            // Also allow waking the device with the power button.
+            ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(kWakePwrPin, 1));
+            ESP_ERROR_CHECK(rtc_gpio_pulldown_en(kWakePwrPin));
+            ESP_ERROR_CHECK(rtc_gpio_pullup_dis(kWakePwrPin));
 
             // If slideshow is enabled, also wake periodically by timer to advance photos.
             if (server_bsp_get_slideshow_enabled())
@@ -1441,6 +1447,33 @@ static void BrowserUploadKeyNextTask(void *arg)
             {
                 xEventGroupSetBits(server_groups, set_bit_button(2));
             }
+        }
+    }
+}
+
+// While awake, a double click on the key button toggles the status icon overlay.
+static void BrowserUploadKeyToggleStatusIconsTask(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        // key_groups bit 3 is set by button_bsp on BTN_DOUBLE_CLICK for USER_KEY_2 (GPIO 4).
+        const EventBits_t bits = xEventGroupWaitBits(key_groups, set_bit_button(3), pdTRUE, pdFALSE, portMAX_DELAY);
+        if (get_bit_button(bits, 3))
+        {
+            server_bsp_mark_activity();
+
+            const bool enabled = server_bsp_get_status_icons_enabled();
+            const bool new_enabled = !enabled;
+            const esp_err_t err = server_bsp_set_status_icons_enabled(new_enabled);
+            if (err != ESP_OK)
+            {
+                ESP_LOGW("key", "Failed to set status icon overlay (%d)", (int)err);
+            }
+
+            // Trigger a re-render of the current image so the overlay updates immediately.
+            xEventGroupSetBits(server_groups, set_bit_button(2));
         }
     }
 }
@@ -1523,6 +1556,7 @@ uint8_t User_Mode_init(void)
         BrowserUploadRenderCurrentOnce();
 
         constexpr gpio_num_t kWakeKeyPin = GPIO_NUM_4; // Key button (active-low)
+        constexpr gpio_num_t kWakePwrPin = GPIO_NUM_5; // Power button (active-high)
 
         esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_AUTO);
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
@@ -1532,6 +1566,10 @@ uint8_t User_Mode_init(void)
         ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
         ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
 
+        ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(kWakePwrPin, 1));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_en(kWakePwrPin));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_dis(kWakePwrPin));
+
         const uint64_t interval_us = (uint64_t)server_bsp_get_slideshow_interval_s() * 1000000ULL;
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(interval_us));
 
@@ -1539,11 +1577,55 @@ uint8_t User_Mode_init(void)
         esp_deep_sleep_start();
     }
 
-    // If we woke from deep sleep via a button, do NOT change the selected photo.
-    // The user can advance photos with a click while awake.
+    // Key-button wake: advance one photo and return to deep sleep without starting Wi-Fi.
     if (wake == ESP_SLEEP_WAKEUP_EXT1)
     {
-        // No-op.
+        ESP_LOGI("browser_upload", "Woke from key button; advancing photo and returning to sleep");
+        (void)server_bsp_select_next_photo();
+        BrowserUploadRenderCurrentOnce();
+
+        constexpr gpio_num_t kWakeKeyPin = GPIO_NUM_4; // Key button (active-low)
+        constexpr gpio_num_t kWakePwrPin = GPIO_NUM_5; // Power button (active-high)
+
+        // ext1 wake is level-triggered; wait for the key to be released so we don't immediately wake again.
+        {
+            gpio_config_t wait_conf = {};
+            wait_conf.intr_type = GPIO_INTR_DISABLE;
+            wait_conf.mode = GPIO_MODE_INPUT;
+            wait_conf.pin_bit_mask = 1ULL << kWakeKeyPin;
+            wait_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+            wait_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&wait_conf));
+
+            const int64_t start_us = esp_timer_get_time();
+            while (gpio_get_level(kWakeKeyPin) == 0 && (esp_timer_get_time() - start_us) < 2000000)
+            {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+
+            ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_reset_pin(kWakeKeyPin));
+        }
+
+        esp_sleep_pd_config(ESP_PD_DOMAIN_MAX, ESP_PD_OPTION_AUTO);
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+        const uint64_t mask = 1ULL << kWakeKeyPin;
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io(mask, ESP_EXT1_WAKEUP_ANY_LOW));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(kWakeKeyPin));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_en(kWakeKeyPin));
+
+        ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(kWakePwrPin, 1));
+        ESP_ERROR_CHECK(rtc_gpio_pulldown_en(kWakePwrPin));
+        ESP_ERROR_CHECK(rtc_gpio_pullup_dis(kWakePwrPin));
+
+        if (server_bsp_get_slideshow_enabled())
+        {
+            const uint64_t interval_us = (uint64_t)server_bsp_get_slideshow_interval_s() * 1000000ULL;
+            ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(interval_us));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_deep_sleep_start();
     }
 
     // Status LED blinking disabled.
@@ -1564,6 +1646,7 @@ uint8_t User_Mode_init(void)
     button_Init();
     xTaskCreate(key1_button_user_Task, "key1_button_user_Task", 4 * 1024, NULL, 3, NULL);
     xTaskCreate(BrowserUploadKeyNextTask, "BrowserUploadKeyNextTask", 4 * 1024, NULL, 3, NULL);
+    xTaskCreate(BrowserUploadKeyToggleStatusIconsTask, "BrowserUploadKeyToggleStatusIconsTask", 4 * 1024, NULL, 3, NULL);
     // Status LED blinking disabled.
 
     // NOTE: Avoid running multiple PMU polling tasks concurrently; it can cause I2C errors/resets.
